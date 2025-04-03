@@ -5,6 +5,7 @@
 #
 from cassandra.protocol import ConfigurationException, InvalidRequest, SyntaxException
 from cassandra.query import SimpleStatement, ConsistencyLevel
+from test.cluster.test_tablets2 import safe_rolling_restart
 from test.pylib.internal_types import ServerInfo
 from test.pylib.manager_client import ManagerClient
 from test.pylib.repair import create_table_insert_data_for_repair
@@ -847,6 +848,124 @@ async def test_two_tablets_concurrent_repair_and_migration(manager: ManagerClien
 
     async def migration_task():
         done, pending = await asyncio.wait([asyncio.create_task(log.wait_for('Started to repair', from_mark=mark)) for log, mark in zip(logs, marks)], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await manager.api.move_tablet(servers[0].ip_addr, ks, "test", migration_replicas.replicas[0][0], migration_replicas.replicas[0][1], migration_replicas.replicas[0][0], 0 if migration_replicas.replicas[0][1] != 0 else 1, migration_replicas.last_token)
+        [await manager.api.message_injection(s.ip_addr, injection) for s in servers]
+        [await manager.api.disable_injection(s.ip_addr, injection) for s in servers]
+
+    await asyncio.gather(repair_task(), migration_task())
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_tablet_split_finalization_with_migrations(manager: ManagerClient):
+    """
+    Reproducer for https://github.com/scylladb/scylladb/issues/21762
+        1) Start a cluster with two nodes with error injected to prevent resize finalisatio
+        2) Create and populate `test` table
+        3) Trigger a split in the table by increasing `min_tablet_count`
+        4) Wait for the table `test` to reach split finalization stage
+        5) Create and populate another table `blocker`
+        6) Disable tablet balancing and move all tablets of `test` and `blocker` table from node 2 to node 1
+        7) Enable tablet balancing and disable error injection to allow migration and finalisation to proceed.
+        8) Expect finalization in `test` to be preferred over migrations in both tables
+    """
+    logger.info("Starting Cluster")
+    cfg = {
+        'enable_user_defined_functions': False, 'enable_tablets': True,
+        'error_injections_at_startup': [
+            'short_tablet_stats_refresh_interval',
+            # intially disable transitioning into tablet_resize_finalization topology state
+            'tablet_split_finalization_postpone',
+            ]
+        }
+    cmdline = [
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'load_balancer=debug',
+    ]
+    servers = await manager.servers_add(2, cmdline=cmdline, config=cfg)
+
+    logger.info("Create and populate test table")
+    cql = manager.get_cql()
+    await cql.run_async("CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 4};")
+    await cql.run_async("CREATE TABLE test.test (pk int PRIMARY KEY, c int);")
+    await manager.api.disable_autocompaction(servers[0].ip_addr, "test")
+    await asyncio.gather(*[cql.run_async(f"INSERT INTO test.test (pk, c) VALUES ({k}, {k%3});") for k in range(64)])
+    await manager.api.keyspace_flush(servers[0].ip_addr, "test", "test")
+    test_table_id = (await cql.run_async("SELECT id FROM system_schema.tables WHERE keyspace_name = 'test' AND table_name = 'test'"))[0].id
+
+    logger.info("Trigger split in table")
+    await cql.run_async("ALTER TABLE test.test WITH tablets = {'min_tablet_count': 8};")
+
+    # Wait for splits to finalise; they don't execute yet as they are prevented by the error injection
+    logger.info("Wait for tablets to split")
+    log = await manager.server_open_log(servers[0].server_id)
+    mark = await log.wait_for(f"Finalizing resize decision for table {test_table_id} as all replicas agree on sequence number 1")
+
+    logger.info("Create and populate `blocker` table")
+    await cql.run_async("CREATE TABLE test.blocker (pk int PRIMARY KEY, c int);")
+    await asyncio.gather(*[cql.run_async(f"INSERT INTO test.blocker (pk, c) VALUES ({k}, {k%3});") for k in range(128)])
+    await manager.api.keyspace_flush(servers[0].ip_addr, "test", "blocker")
+    blocker_table_id = (await cql.run_async("SELECT id FROM system_schema.tables WHERE keyspace_name = 'test' AND table_name = 'blocker'"))[0].id
+
+    s0_host_id = await manager.get_host_id(servers[0].server_id)
+    for cf in ["test", "blocker"]:
+        logger.info(f"Move all tablets of test.{cf} from Node 2 to Node 1")
+        await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+        s1_replicas = await get_all_tablet_replicas(manager, servers[1], "test", cf)
+        migration_tasks = [
+            manager.api.move_tablet(servers[0].ip_addr, "test", cf,
+                                    tablet.replicas[0][0], tablet.replicas[0][1],
+                                    s0_host_id, 0, tablet.last_token)
+            for tablet in s1_replicas
+        ]
+        await asyncio.gather(*migration_tasks)
+
+    logger.info("Re-enable tablet balancing; it should be blocked by pending split finalization")
+    await manager.api.enable_tablet_balancing(servers[0].ip_addr)
+    mark = await log.wait_for("Setting tablet balancing to true")
+
+    logger.info("Unblock resize finalisation and verify that the finalisation is preferred over migrations")
+    await manager.api.disable_injection(servers[0].ip_addr, "tablet_split_finalization_postpone")
+    split_finalization_mark = await log.wait_for("Finished tablet split finalization", mark)
+    for table_id in [test_table_id, blocker_table_id]:
+        migration_mark = await log.wait_for(f"Will set tablet {table_id}:\\d+ stage to write_both_read_old", mark)
+        assert split_finalization_mark < migration_mark, f"Tablet migration of {table_id} was scheduled before resize finalization"
+
+    # ensure all migrations complete
+    logger.info("Waiting for migrations to complete")
+    await log.wait_for("Tablet load balancer did not make any plan", migration_mark)
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_two_tablets_concurrent_repair_and_migration_repair_writer_level(manager: ManagerClient):
+    injection = "repair_writer_impl_create_writer_wait"
+    cmdline = [
+        '--logger-log-level', 'repair=debug',
+    ]
+    servers, cql, hosts, ks, table_id = await create_table_insert_data_for_repair(manager, cmdline=cmdline)
+    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+
+    async def insert_with_down(down_server):
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k + 1});") for k in range(10)])
+
+    cql = await safe_rolling_restart(manager, [servers[0]], with_down=insert_with_down)
+
+    all_replicas = await get_all_tablet_replicas(manager, servers[1], ks, "test")
+    all_replicas.sort(key=lambda x: x.last_token)
+    assert len(all_replicas) >= 3
+    repair_replicas = all_replicas[1]
+    migration_replicas = all_replicas[0]
+
+    logs = [await manager.server_open_log(s.server_id) for s in servers]
+    marks = [await log.mark() for log in logs]
+
+    async def repair_task():
+        [await manager.api.enable_injection(s.ip_addr, injection, one_shot=True) for s in servers]
+        await manager.api.tablet_repair(servers[0].ip_addr, ks, "test", repair_replicas.last_token)
+
+    async def migration_task():
+        done, pending = await asyncio.wait([asyncio.create_task(log.wait_for(f'repair_writer: keyspace={ks}', from_mark=mark)) for log, mark in zip(logs, marks)], return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         await manager.api.move_tablet(servers[0].ip_addr, ks, "test", migration_replicas.replicas[0][0], migration_replicas.replicas[0][1], migration_replicas.replicas[0][0], 0 if migration_replicas.replicas[0][1] != 0 else 1, migration_replicas.last_token)

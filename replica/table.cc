@@ -182,7 +182,7 @@ table::add_memtables_to_reader_list(std::vector<mutation_reader>& readers,
         std::function<void(size_t)> reserve_fn) const {
     auto add_memtables_from_cg = [&] (compaction_group& cg) mutable {
         for (auto&& mt: *cg.memtables()) {
-            if (auto reader_opt = mt->make_flat_reader_opt(s, permit, range, slice, trace_state, fwd, fwd_mr)) {
+            if (auto reader_opt = mt->make_mutation_reader_opt(s, permit, range, slice, trace_state, fwd, fwd_mr)) {
                 readers.emplace_back(std::move(*reader_opt));
             }
         }
@@ -1248,14 +1248,6 @@ const storage_group_map& table::storage_groups() const {
     return _sg_manager->storage_groups();
 }
 
-future<> table::safe_foreach_sstable(const sstables::sstable_set& set, noncopyable_function<future<>(const sstables::shared_sstable&)> action) {
-    auto deletion_guard = co_await get_sstable_list_permit();
-
-    co_await set.for_each_sstable_gently([&] (const sstables::shared_sstable& sst) -> future<> {
-        return action(sst);
-    });
-}
-
 future<utils::chunked_vector<sstables::sstable_files_snapshot>> table::take_storage_snapshot(dht::token_range tr) {
     utils::chunked_vector<sstables::sstable_files_snapshot> ret;
 
@@ -1268,9 +1260,11 @@ future<utils::chunked_vector<sstables::sstable_files_snapshot>> table::take_stor
 
         co_await cg->flush();
 
-        auto set = cg->make_sstable_set();
-
-        co_await safe_foreach_sstable(*set, [&] (const sstables::shared_sstable& sst) -> future<> {
+        // The sstable set must be obtained *after* the deletion lock is taken,
+        // otherwise components of sstables in the set might be unlinked from the filesystem
+        // by compaction while we are waiting for the lock.
+        auto deletion_guard = co_await get_sstable_list_permit();
+        co_await cg->make_sstable_set()->for_each_sstable_gently([&] (const sstables::shared_sstable& sst) -> future<> {
            ret.push_back({
                .sst = sst,
                .files = co_await sst->readable_file_for_all_components(),
@@ -1281,6 +1275,15 @@ future<utils::chunked_vector<sstables::sstable_files_snapshot>> table::take_stor
     co_return std::move(ret);
 }
 
+future<utils::chunked_vector<sstables::shared_sstable>> table::take_sstable_set_snapshot() {
+    auto deletion_guard = co_await get_sstable_list_permit();
+    utils::chunked_vector<sstables::shared_sstable> result;
+    co_await get_sstable_set().for_each_sstable_gently([&] (sstables::shared_sstable sst) {
+        result.push_back(sst);
+    });
+    co_return result;
+}
+
 future<utils::chunked_vector<sstables::entry_descriptor>>
 table::clone_tablet_storage(locator::tablet_id tid) {
     utils::chunked_vector<sstables::entry_descriptor> ret;
@@ -1289,8 +1292,11 @@ table::clone_tablet_storage(locator::tablet_id tid) {
     auto& sg = storage_group_for_id(tid.value());
     auto sg_holder = sg.async_gate().hold();
     co_await sg.flush();
-    auto set = sg.make_sstable_set();
-    co_await safe_foreach_sstable(*set, [&] (const sstables::shared_sstable& sst) -> future<> {
+    // The sstable set must be obtained *after* the deletion lock is taken,
+    // otherwise components of sstables in the set might be unlinked from the filesystem
+    // by compaction while we are waiting for the lock.
+    auto deletion_guard = co_await get_sstable_list_permit();
+    co_await sg.make_sstable_set()->for_each_sstable_gently([&] (const sstables::shared_sstable& sst) -> future<> {
         ret.push_back(co_await sst->clone(calculate_generation_for_new_table()));
     });
     co_return ret;

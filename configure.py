@@ -680,8 +680,8 @@ arg_parser.add_argument('--compiler', action='store', dest='cxx', default='clang
                         help='C++ compiler path')
 arg_parser.add_argument('--c-compiler', action='store', dest='cc', default='clang',
                         help='C compiler path')
-add_tristate(arg_parser, name='dpdk', dest='dpdk',
-                        help='Use dpdk (from seastar dpdk sources) (default=True for release builds)')
+add_tristate(arg_parser, name='dpdk', dest='dpdk', default=False,
+                        help='Use dpdk (from seastar dpdk sources)')
 arg_parser.add_argument('--dpdk-target', action='store', dest='dpdk_target', default='',
                         help='Path to DPDK SDK target location (e.g. <DPDK SDK dir>/x86_64-native-linuxapp-gcc)')
 arg_parser.add_argument('--debuginfo', action='store', dest='debuginfo', type=int, default=1,
@@ -812,6 +812,7 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/rjson.cc',
                 'utils/human_readable.cc',
                 'utils/histogram_metrics_helper.cc',
+                'utils/io-wrappers.cc',
                 'utils/on_internal_error.cc',
                 'utils/pretty_printers.cc',
                 'utils/stream_compressor.cc',
@@ -825,7 +826,7 @@ scylla_core = (['message/messaging_service.cc',
                 'keys.cc',
                 'counters.cc',
                 'compress.cc',
-                'zstd.cc',
+                'sstable_dict_autotrainer.cc',
                 'sstables/sstables.cc',
                 'sstables/sstables_manager.cc',
                 'sstables/sstable_set.cc',
@@ -1163,6 +1164,7 @@ scylla_core = (['message/messaging_service.cc',
                 'ent/encryption/kms_key_provider.cc',
                 'ent/encryption/gcp_host.cc',
                 'ent/encryption/gcp_key_provider.cc',
+                'ent/encryption/utils.cc',
                 'ent/ldap/ldap_connection.cc',
                 'multishard_mutation_query.cc',
                 'reader_concurrency_semaphore.cc',
@@ -1731,19 +1733,11 @@ def generate_version(date_stamp):
 # the program headers.
 def dynamic_linker_option():
     gcc_linker_output = subprocess.check_output(['gcc', '-###', '/dev/null', '-o', 't'], stderr=subprocess.STDOUT).decode('utf-8')
-    original_dynamic_linker = re.search('-dynamic-linker ([^ ]*)', gcc_linker_output).groups()[0]
+    original_dynamic_linker = re.search('"?-dynamic-linker"?[ =]"?([^ "]*)"?[ \n]', gcc_linker_output).groups()[0]
 
-    employ_ld_trickery = True
-    # distro-specific setup
-    if os.environ.get('NIX_CC'):
-        employ_ld_trickery = False
-
-    if employ_ld_trickery:
-        # gdb has a SO_NAME_MAX_PATH_SIZE of 512, so limit the path size to
-        # that. The 512 includes the null at the end, hence the 511 below.
-        dynamic_linker = '/' * (511 - len(original_dynamic_linker)) + original_dynamic_linker
-    else:
-        dynamic_linker = original_dynamic_linker
+    # gdb has a SO_NAME_MAX_PATH_SIZE of 512, so limit the path size to
+    # that. The 512 includes the null at the end, hence the 511 below.
+    dynamic_linker = '/' * (511 - len(original_dynamic_linker)) + original_dynamic_linker
     return f'--dynamic-linker={dynamic_linker}'
 
 forced_ldflags = '-Wl,'
@@ -1965,8 +1959,6 @@ def configure_seastar(build_dir, mode, mode_config):
         seastar_cmake_args += ['-DSeastar_STACK_GUARDS={}'.format(stack_guards)]
 
     dpdk = args.dpdk
-    if dpdk is None:
-        dpdk = platform.machine() == 'x86_64' and mode == 'release'
     if dpdk:
         seastar_cmake_args += ['-DSeastar_DPDK=ON', '-DSeastar_DPDK_MACHINE=westmere']
     if args.split_dwarf:
