@@ -86,12 +86,34 @@ struct error_injection_at_startup {
 
 std::istream& operator>>(std::istream& is, error_injection_at_startup&);
 
+struct object_storage_endpoint_param {
+    sstring endpoint;
+    s3::endpoint_config config;
+
+    bool operator==(const object_storage_endpoint_param& other) const {
+        return endpoint == other.endpoint && config == other.config;
+    }
+
+    sstring to_json_string() const {
+            return fmt::format("{{ \"port\": {}, \"use_https\": {}, \"aws_region\": \"{}\", \"iam_role_arn\": \"{}\" }}",
+            config.port, config.use_https, config.region, config.role_arn);
+    }
+
+    friend fmt::formatter<object_storage_endpoint_param>;
+};
+
+std::istream& operator>>(std::istream& is, object_storage_endpoint_param& f);
 }
 
 template<>
 struct fmt::formatter<db::error_injection_at_startup> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
     auto format(const db::error_injection_at_startup&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<db::object_storage_endpoint_param> : fmt::formatter<sstring_view> {
+    auto format(const db::object_storage_endpoint_param&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 namespace utils {
@@ -134,6 +156,20 @@ struct replication_strategy_restriction_t {
 };
 
 constexpr unsigned default_murmur3_partitioner_ignore_msb_bits = 12;
+
+struct tablets_mode_t {
+    // The `unset` mode is used internally for backward compatibility
+    // with the legacy `enable_tablets` option.
+    // It is defined as -1 as existing test code associates the value
+    // 0 with `false` and 1 with `true` when read from system.config.
+    enum class mode : int8_t {
+        unset = -1,
+        disabled = 0,
+        enabled = 1,
+        enforced = 2
+    };
+    static std::unordered_map<sstring, mode> map(); // for enum_option<>
+};
 
 class config final : public utils::config_file {
 public:
@@ -400,6 +436,12 @@ public:
     named_value<bool> enable_sstables_mc_format;
     named_value<bool> enable_sstables_md_format;
     named_value<sstring> sstable_format;
+    named_value<bool> sstable_compression_dictionaries_enable_writing;
+    named_value<float> sstable_compression_dictionaries_memory_budget_fraction;
+    named_value<float> sstable_compression_dictionaries_retrain_period_in_seconds;
+    named_value<float> sstable_compression_dictionaries_autotrainer_tick_period_in_seconds;
+    named_value<uint64_t> sstable_compression_dictionaries_min_training_dataset_bytes;
+    named_value<float> sstable_compression_dictionaries_min_training_improvement_factor;
     named_value<bool> uuid_sstable_identifiers_enabled;
     named_value<bool> table_digest_insensitive_to_expiry;
     named_value<bool> enable_dangerous_direct_import_of_cassandra_counters;
@@ -426,6 +468,7 @@ public:
     named_value<unsigned> user_defined_function_contiguous_allocation_limit_bytes;
     named_value<uint32_t> schema_registry_grace_period;
     named_value<uint32_t> max_concurrent_requests_per_shard;
+    named_value<uint32_t> uninitialized_connections_semaphore_cpu_concurrency;
     named_value<bool> cdc_dont_rewrite_streams;
     named_value<tri_mode_restriction> strict_allow_filtering;
     named_value<tri_mode_restriction> strict_is_not_null_in_views;
@@ -442,6 +485,7 @@ public:
     named_value<uint32_t> alternator_timeout_in_ms;
     named_value<double> alternator_ttl_period_in_seconds;
     named_value<sstring> alternator_describe_endpoints;
+    named_value<uint32_t> alternator_max_items_in_batch_write;
 
     named_value<bool> abort_on_ebadf;
 
@@ -485,7 +529,6 @@ public:
     named_value<uint64_t> wasm_udf_total_fuel;
     named_value<size_t> wasm_udf_memory_limit;
     named_value<sstring> relabel_config_file;
-    named_value<sstring> object_storage_config_file;
     // wasm_udf_reserved_memory is static because the options in db::config
     // are parsed using seastar::app_template, while this option is used for
     // configuring the Seastar memory subsystem.
@@ -533,11 +576,28 @@ public:
 
     const db::extensions& extensions() const;
 
-    utils::updateable_value_source<std::unordered_map<sstring, s3::endpoint_config>> object_storage_config;
+    named_value<std::vector<object_storage_endpoint_param>> object_storage_endpoints;
 
     named_value<std::vector<error_injection_at_startup>> error_injections_at_startup;
     named_value<double> topology_barrier_stall_detector_threshold_seconds;
     named_value<bool> enable_tablets;
+    named_value<enum_option<tablets_mode_t>> tablets_mode_for_new_keyspaces;
+
+    bool enable_tablets_by_default() const noexcept {
+        switch (tablets_mode_for_new_keyspaces()) {
+        case tablets_mode_t::mode::unset:
+            return enable_tablets();
+        case tablets_mode_t::mode::disabled:
+            return false;
+        case tablets_mode_t::mode::enabled:
+        case tablets_mode_t::mode::enforced:
+            return true;
+        }
+    }
+    bool enforce_tablets() const noexcept {
+        return tablets_mode_for_new_keyspaces() == tablets_mode_t::mode::enforced;
+    }
+
     named_value<uint32_t> view_flow_control_delay_limit_in_ms;
 
     named_value<int> disk_space_monitor_normal_polling_interval_in_seconds;

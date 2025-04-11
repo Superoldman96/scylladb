@@ -283,6 +283,11 @@ memtable::slice(const dht::partition_range& range) const {
 }
 
 class iterator_reader {
+    // DO NOT RELEASE the memtable! Keep a reference to it, so it stays in
+    // memtable_list::_flushed_memtables_with_active_reads and so that it keeps
+    // blocking tombstone GC of tombstone in the cache, which cover data that
+    // used to be in this memtable, and which will possibly be produced by this
+    // reader later on.
     lw_shared_ptr<memtable> _memtable;
     schema_ptr _schema;
     const dht::partition_range* _range;
@@ -381,7 +386,6 @@ protected:
                                     streamed_mutation::forwarding fwd,
                                     mutation_reader::forwarding fwd_mr) {
         auto ret = _memtable->_underlying->make_reader_v2(_schema, std::move(permit), delegate, slice, nullptr, fwd, fwd_mr);
-        _memtable = {};
         _last = {};
         return ret;
     }
@@ -706,7 +710,7 @@ partition_snapshot_ptr memtable_entry::snapshot(memtable& mtbl) {
 }
 
 mutation_reader_opt
-memtable::make_flat_reader_opt(schema_ptr query_schema,
+memtable::make_mutation_reader_opt(schema_ptr query_schema,
                       reader_permit permit,
                       const dht::partition_range& range,
                       const query::partition_slice& slice,
@@ -766,7 +770,7 @@ memtable::update(db::rp_handle&& h) {
 
 future<>
 memtable::apply(memtable& mt, reader_permit permit) {
-    if (auto reader_opt = mt.make_flat_reader_opt(_schema, std::move(permit), query::full_partition_range, _schema->full_slice())) {
+    if (auto reader_opt = mt.make_mutation_reader_opt(_schema, std::move(permit), query::full_partition_range, _schema->full_slice())) {
         return with_closeable(std::move(*reader_opt), [this] (auto&& rd) mutable {
             return consume_partitions(rd, [self = this->shared_from_this()] (mutation&& m) {
                 self->apply(m);
@@ -816,7 +820,7 @@ mutation_source memtable::as_data_source() {
             tracing::trace_state_ptr trace_state,
             streamed_mutation::forwarding fwd,
             mutation_reader::forwarding fwd_mr) {
-        return mt->make_flat_reader(std::move(s), std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr);
+        return mt->make_mutation_reader(std::move(s), std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr);
     });
 }
 
@@ -832,6 +836,10 @@ stop_iteration memtable_entry::clear_gently() noexcept {
 
 void memtable::mark_flushed(mutation_source underlying) noexcept {
     _underlying = std::move(underlying);
+}
+
+bool memtable::is_merging_to_cache() const noexcept {
+    return _merging_into_cache;
 }
 
 bool memtable::is_flushed() const noexcept {

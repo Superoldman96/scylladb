@@ -136,6 +136,7 @@ public:
     gms::feature zero_token_nodes { *this, "ZERO_TOKEN_NODES"sv };
     gms::feature view_build_status_on_group0 { *this, "VIEW_BUILD_STATUS_ON_GROUP0"sv };
     gms::feature views_with_tablets { *this, "VIEWS_WITH_TABLETS"sv };
+    gms::feature group0_limited_voters { *this, "GROUP0_LIMITED_VOTERS"sv };
 
     // Whether to allow fragmented commitlog entries. While this is a node-local feature as such, hide
     // behind a feature to ensure an upgrading cluster appears to be at least functional before using,
@@ -165,6 +166,8 @@ public:
     gms::feature compression_dicts { *this, "COMPRESSION_DICTS"sv };
     gms::feature tablet_options { *this, "TABLET_OPTIONS"sv };
     gms::feature tablet_load_stats_v2 { *this, "TABLET_LOAD_STATS_V2"sv };
+    gms::feature sstable_compression_dicts { *this, "SSTABLE_COMPRESSION_DICTS"sv };
+    gms::feature repair_based_tablet_rebuild { *this, "REPAIR_BASED_TABLET_REBUILD"sv };
 public:
 
     const std::unordered_map<sstring, std::reference_wrapper<feature>>& registered_features() const;

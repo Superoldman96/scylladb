@@ -104,7 +104,10 @@ class dirty_memory_manager;
 struct table_stats;
 
 // Managed by lw_shared_ptr<>.
-class memtable final : public enable_lw_shared_from_this<memtable>, private dirty_memory_manager_logalloc::size_tracked_region {
+class memtable final
+    : public enable_lw_shared_from_this<memtable>
+    , public boost::intrusive::list_base_hook<boost::intrusive::link_mode<boost::intrusive::auto_unlink>>
+    , private dirty_memory_manager_logalloc::size_tracked_region {
 public:
     using partitions_type = double_decker<int64_t, memtable_entry,
                             dht::raw_token_less_comparator, dht::ring_position_comparator,
@@ -127,6 +130,7 @@ private:
     // monotonic. That combined source in this case is cache + memtable.
     mutation_source_opt _underlying;
     uint64_t _flushed_memory = 0;
+    bool _merging_into_cache = false;
     bool _merged_into_cache = false;
     replica::table_stats& _table_stats;
 
@@ -269,21 +273,21 @@ public:
     // The 'range' parameter must be live as long as the reader is being used
     //
     // Mutations returned by the reader will all have given schema.
-    mutation_reader make_flat_reader(schema_ptr s,
+    mutation_reader make_mutation_reader(schema_ptr s,
                                              reader_permit permit,
                                              const dht::partition_range& range,
                                              const query::partition_slice& slice,
                                              tracing::trace_state_ptr trace_state_ptr = nullptr,
                                              streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                              mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes) {
-        if (auto reader_opt = make_flat_reader_opt(s, permit, range, slice, std::move(trace_state_ptr), fwd, fwd_mr)) {
+        if (auto reader_opt = make_mutation_reader_opt(s, permit, range, slice, std::move(trace_state_ptr), fwd, fwd_mr)) {
             return std::move(*reader_opt);
         }
         [[unlikely]] return make_empty_flat_reader_v2(std::move(s), std::move(permit));
     }
-    // Same as make_flat_reader, but returns an empty optional instead of a no-op reader when there is nothing to
+    // Same as make_mutation_reader, but returns an empty optional instead of a no-op reader when there is nothing to
     // read. This is an optimization.
-    mutation_reader_opt make_flat_reader_opt(schema_ptr query_schema,
+    mutation_reader_opt make_mutation_reader_opt(schema_ptr query_schema,
                                           reader_permit permit,
                                           const dht::partition_range& range,
                                           const query::partition_slice& slice,
@@ -291,11 +295,11 @@ public:
                                           streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                           mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes);
 
-    mutation_reader make_flat_reader(schema_ptr s,
+    mutation_reader make_mutation_reader(schema_ptr s,
                                              reader_permit permit,
                                              const dht::partition_range& range = query::full_partition_range) {
         auto& full_slice = s->full_slice();
-        return make_flat_reader(s, std::move(permit), range, full_slice);
+        return make_mutation_reader(s, std::move(permit), range, full_slice);
     }
 
     mutation_reader make_flush_reader(schema_ptr, reader_permit permit);
@@ -304,6 +308,7 @@ public:
 
     bool empty() const noexcept { return partitions.empty(); }
     void mark_flushed(mutation_source) noexcept;
+    bool is_merging_to_cache() const noexcept;
     bool is_flushed() const noexcept;
     void on_detach_from_region_group() noexcept;
     void revert_flushed_memory() noexcept;

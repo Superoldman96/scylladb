@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 import random
@@ -35,7 +36,10 @@ TESTS_COUNT = 1  # number of tests from the whole matrix to run, None to run the
 
 # Following parameters can be adjusted to run same sequence of tests from a previous run.  Look at logs for the values.
 # Also see `pytest_generate_tests()` below for details.
-TESTS_SHUFFLE_SEED = random.randrange(sys.maxsize)  # seed for the tests order randomization
+
+# Seed for the tests order randomization.
+TESTS_SHUFFLE_SEED = int(os.environ.get("TOPOLOGY_RANDOM_FAILURES_TEST_SHUFFLE_SEED", random.randrange(sys.maxsize)))
+
 ERROR_INJECTIONS_COUNT = len(ERROR_INJECTIONS)  # change it to limit number of error injections
 CLUSTER_EVENTS_COUNT = len(CLUSTER_EVENTS)  # change it to limit number of cluster events
 
@@ -52,6 +56,8 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     # Deselect unsupported combinations.  Do it after the shuffle to have the stable order.
     tests = [
         (inj, event) for inj, event in tests if inj not in getattr(event, "deselected_random_failures", {})
+        # issue #23418: skip the "stop_before_becoming_raft_voter" tests for now
+        | {"stop_before_becoming_raft_voter": "issue #23418"}
     ]
 
     metafunc.parametrize(["error_injection", "cluster_event"], tests[:TESTS_COUNT])

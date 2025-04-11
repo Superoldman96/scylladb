@@ -78,6 +78,8 @@ class compaction_manager;
 class frozen_mutation;
 class reconcilable_result;
 
+namespace bi = boost::intrusive;
+
 namespace tracing { class trace_state_ptr; }
 namespace s3 { struct endpoint_config; }
 
@@ -109,6 +111,8 @@ struct sstable_files_snapshot;
 struct entry_descriptor;
 
 }
+
+class sstable_compressor_factory;
 
 namespace ser {
 template<typename T>
@@ -179,8 +183,13 @@ class global_table_ptr;
 class memtable_list {
 public:
     using seal_immediate_fn_type = std::function<future<> (flush_permit&&)>;
+    using intrusive_memtable_list = bi::list<
+            memtable,
+            bi::base_hook<bi::list_base_hook<bi::link_mode<bi::auto_unlink>>>,
+            bi::constant_time_size<false>>;
 private:
     std::vector<shared_memtable> _memtables;
+    intrusive_memtable_list _flushed_memtables_with_active_reads;
     seal_immediate_fn_type _seal_immediate_fn;
     std::function<schema_ptr()> _current_schema;
     replica::dirty_memory_manager* _dirty_memory_manager;
@@ -236,6 +245,15 @@ public:
         return _memtables.back();
     }
 
+    // Returns the minimum live timestamp. Considers all memtables, even
+    // those that were flushed and removed with erase(), but an
+    // in-progress read is still using them.
+    // Memtables whose min live timestamp > max_seen_timestamp are ignored as we
+    // consider that their content is more recent than any potential tombstone in
+    // other mutation sources.
+    // Returns api::max_timestamp if the key is not in any of the memtables.
+    api::timestamp_type min_live_timestamp(const dht::decorated_key& dk, is_shadowable is, api::timestamp_type max_seen_timestamp) const noexcept;
+
     // # 8904 - this method is akin to std::set::erase(key_type), not
     // erase(iterator). Should be tolerant against non-existing.
     void erase(const shared_memtable& element) noexcept {
@@ -243,6 +261,7 @@ public:
         if (i != _memtables.end()) {
             _memtables.erase(i);
         }
+        _flushed_memtables_with_active_reads.push_back(*element);
     }
 
     // Synchronously swaps the active memtable with a new, empty one,
@@ -477,6 +496,9 @@ private:
     std::optional<sstables::sstable_generation_generator> _sstable_generation_generator;
 
     db::replay_position _highest_rp;
+    // Tracks the highest replay position flushed to a sstable
+    db::replay_position _highest_flushed_rp;
+    // Tracks the highest position before flush actually starts
     db::replay_position _flush_rp;
     db::replay_position _lowest_allowed_rp;
 
@@ -650,13 +672,6 @@ private:
     void for_each_compaction_group(std::function<void(const compaction_group&)> action) const;
     // Unsafe reference to all storage groups. Don't use it across preemption points.
     const storage_group_map& storage_groups() const;
-
-    // Safely iterate through SSTables, with deletion guard taken to make sure they're not
-    // removed during iteration.
-    // WARNING: Be careful that the action doesn't perform an operation that will itself
-    // take the deletion guard, as that will cause a deadlock. For example, memtable flush
-    // can wait on compaction (backpressure) which in turn takes deletion guard on completion.
-    future<> safe_foreach_sstable(const sstables::sstable_set&, noncopyable_function<future<>(const sstables::shared_sstable&)> action);
 
     // Returns a sstable set that can be safely used for purging any expired tombstone in a compaction group.
     // Only the sstables in the compaction group is not sufficient, since there might be other compaction
@@ -978,6 +993,7 @@ public:
     future<bool> snapshot_exists(sstring name);
 
     db::replay_position set_low_replay_position_mark();
+    db::replay_position highest_flushed_replay_position() const;
 
 private:
     using snapshot_file_set = foreign_ptr<std::unique_ptr<std::unordered_set<sstring>>>;
@@ -1286,6 +1302,9 @@ public:
     // all compaction groups that overlap with a given token range. The output is
     // a list of SSTables that represent the snapshot.
     future<utils::chunked_vector<sstables::sstable_files_snapshot>> take_storage_snapshot(dht::token_range tr);
+
+    // Takes snapshot of current sstable set all compaction groups.
+    future<utils::chunked_vector<sstables::shared_sstable>> take_sstable_set_snapshot();
 
     // Clones storage of a given tablet. Memtable is flushed first to guarantee that the
     // snapshot (list of sstables) will include all the data written up to the time it was taken.
@@ -1652,7 +1671,7 @@ public:
     future<> parse_system_tables(distributed<service::storage_proxy>&, sharded<db::system_keyspace>&);
 
     database(const db::config&, database_config dbcfg, service::migration_notifier& mn, gms::feature_service& feat, const locator::shared_token_metadata& stm,
-            compaction_manager& cm, sstables::storage_manager& sstm, lang::manager& langm, sstables::directory_semaphore& sst_dir_sem, const abort_source& abort,
+            compaction_manager& cm, sstables::storage_manager& sstm, lang::manager& langm, sstables::directory_semaphore& sst_dir_sem, sstable_compressor_factory&, const abort_source& abort,
             utils::cross_shard_barrier barrier = utils::cross_shard_barrier(utils::cross_shard_barrier::solo{}) /* for single-shard usage */);
     database(database&&) = delete;
     ~database();
@@ -1843,6 +1862,8 @@ public:
         return is_sys_ks ? get_system_sstables_manager() : get_user_sstables_manager();
     }
 
+    sstables::sstables_manager& get_sstables_manager(const schema& s) const;
+
     // Returns the list of ranges held by this endpoint
     // The returned list is sorted, and its elements are non overlapping and non wrap-around.
     future<dht::token_range_vector> get_keyspace_local_ranges(locator::vnode_effective_replication_map_ptr erm);
@@ -1872,7 +1893,7 @@ public:
     static future<> drop_cache_for_table_on_all_shards(sharded<database>& sharded_db, table_id id);
     static future<> drop_cache_for_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name);
 
-    static future<> snapshot_table_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring table_name, sstring tag, bool skip_flush);
+    static future<> snapshot_table_on_all_shards(sharded<database>& sharded_db, table_id id, sstring tag, bool skip_flush);
     static future<> snapshot_tables_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, std::vector<sstring> table_names, sstring tag, bool skip_flush);
     static future<> snapshot_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring tag, bool skip_flush);
 
@@ -1886,7 +1907,7 @@ private:
     struct table_truncate_state;
 
     static future<> truncate_table_on_all_shards(sharded<database>& db, sharded<db::system_keyspace>& sys_ks, const global_table_ptr&, std::optional<db_clock::time_point> truncated_at_opt, bool with_snapshot, std::optional<sstring> snapshot_name_opt);
-    future<> truncate(db::system_keyspace& sys_ks, column_family& cf, const table_truncate_state&, db_clock::time_point truncated_at);
+    future<> truncate(db::system_keyspace& sys_ks, column_family& cf, const table_truncate_state&);
 public:
     /** Truncates the given column family */
     // If truncated_at_opt is not given, it is set to db_clock::now right after flush/clear.
@@ -1959,6 +1980,24 @@ public:
     // * the `locator::topology` instance corresponding to the passed `locator::token_metadata_ptr`
     //   must contain a complete list of racks and data centers in the cluster.
     void check_rf_rack_validity(const locator::token_metadata_ptr) const;
+private:
+    // SSTable sampling might require considerable amounts of memory,
+    // so we want to limit the number of concurrent sampling operations.
+    //
+    // The `sharded` semaphore serializes the number of SSTable sampling operations
+    // for which this shard is the coordinator.
+    // The `local` semaphore serializes the number of SSTable sampling operations
+    // in which this shard is a participant.
+    size_t _memory_for_data_file_samples = 16*1024*1024;
+    semaphore _sample_data_files_memory_limiter{_memory_for_data_file_samples};
+    semaphore _sample_data_files_local_concurrency_limiter{1};
+public:
+    // Returns a vector of file chunks randomly sampled from all Data.db files of this table.
+    future<utils::chunked_vector<temporary_buffer<char>>> sample_data_files(
+        table_id id,
+        uint64_t chunk_size,
+        uint64_t n_chunks
+    );
 };
 
 // A helper function to parse the directory name back

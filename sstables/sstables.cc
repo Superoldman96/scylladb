@@ -83,6 +83,7 @@
 #include "release.hh"
 #include "utils/build_id.hh"
 #include "utils/labels.hh"
+#include "utils/io-wrappers.hh"
 
 #include <boost/lexical_cast.hpp>
 
@@ -148,16 +149,6 @@ read_monitor_generator& default_read_monitor_generator() {
 future<file> sstable::new_sstable_component_file(const io_error_handler& error_handler, component_type type, open_flags flags, file_open_options options) const noexcept {
   try {
     auto f = _storage->open_component(*this, type, flags, options, _manager.config().enable_sstable_data_integrity_check());
-
-    if (type != component_type::TOC && type != component_type::TemporaryTOC) {
-        for (auto * ext : _manager.config().extensions().sstable_file_io_extensions()) {
-            f = with_file_close_on_failure(std::move(f), [ext, this, type, flags] (file f) {
-               return ext->wrap_file(const_cast<sstable&>(*this), type, f, flags).then([f](file nf) mutable {
-                   return nf ? nf : std::move(f);
-               });
-            });
-        }
-    }
 
     f = with_file_close_on_failure(std::move(f), [&error_handler] (file f) {
         return make_checked_file(error_handler, std::move(f));
@@ -864,7 +855,7 @@ void sstable::generate_toc() {
     if (_schema->bloom_filter_fp_chance() != 1.0) {
         _recognized_components.insert(component_type::Filter);
     }
-    if (_schema->get_compressor_params().get_compressor() == nullptr) {
+    if (!_schema->get_compressor_params().compression_enabled()) {
         _recognized_components.insert(component_type::CRC);
     } else {
         _recognized_components.insert(component_type::CompressionInfo);
@@ -1058,10 +1049,13 @@ template void sstable::write_simple<component_type::Summary>(const sstables::sum
 future<> sstable::read_compression() {
      // FIXME: If there is no compression, we should expect a CRC file to be present.
     if (!has_component(component_type::CompressionInfo)) {
-        return make_ready_future<>();
+        co_return;
     }
 
-    return read_simple<component_type::CompressionInfo>(_components->compression);
+    co_await read_simple<component_type::CompressionInfo>(_components->compression);
+    auto compressor = co_await manager().get_compressor_factory().make_compressor_for_reading(_components->compression);
+    _components->compression.set_compressor(std::move(compressor));
+    _components->compression.discard_hidden_options();
 }
 
 void sstable::write_compression() {
@@ -1812,12 +1806,14 @@ sstable::read_scylla_metadata() noexcept {
         if (!has_component(component_type::Scylla)) {
             return make_ready_future<>();
         }
-        return read_simple<component_type::Scylla>(*_components->scylla_metadata);
+        return read_simple<component_type::Scylla>(*_components->scylla_metadata).then([this] {
+            _features = _components->scylla_metadata->get_features();
+        });
     });
 }
 
 void
-sstable::write_scylla_metadata(shard_id shard, sstable_enabled_features features, struct run_identifier identifier,
+sstable::write_scylla_metadata(shard_id shard, struct run_identifier identifier,
         std::optional<scylla_metadata::large_data_stats> ld_stats, std::optional<scylla_metadata::ext_timestamp_stats> ts_stats) {
     auto&& first_key = get_first_decorated_key();
     auto&& last_key = get_last_decorated_key();
@@ -1835,7 +1831,8 @@ sstable::write_scylla_metadata(shard_id shard, sstable_enabled_features features
     }
 
     _components->scylla_metadata->data.set<scylla_metadata_type::Sharding>(std::move(sm));
-    _components->scylla_metadata->data.set<scylla_metadata_type::Features>(std::move(features));
+    // Note: data.set() wants an rvalue, so we have to make a copy. It's a uint64 anyway.
+    _components->scylla_metadata->data.set<scylla_metadata_type::Features>(sstable_enabled_features(_features));
     _components->scylla_metadata->data.set<scylla_metadata_type::RunIdentifier>(std::move(identifier));
     if (ld_stats) {
         _components->scylla_metadata->data.set<scylla_metadata_type::LargeDataStats>(std::move(*ld_stats));
@@ -3622,6 +3619,18 @@ generation_type::from_string(const std::string& s) {
 
 sstring component_name::format() const {
     return sst._storage->prefix() + "/" + sst.component_basename(component);
+}
+
+future<data_sink> file_io_extension::wrap_sink(const sstable& sst, component_type c, data_sink sink) {
+    file dummy = create_noop_file();
+    auto f = co_await wrap_file(sst, c, std::move(dummy), open_flags::wo);
+
+    if (!f) {
+        co_return sink;
+    }
+    co_await f.close();
+    f = co_await wrap_file(sst, c, create_file_for_sink(std::move(sink)), open_flags::wo);
+    co_return co_await make_file_data_sink(std::move(f), file_output_stream_options{});
 }
 
 } // namespace sstables
