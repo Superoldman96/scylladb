@@ -12,6 +12,7 @@
 #include "redis/command_factory.hh"
 #include "redis/options.hh"
 #include "service_permit.hh"
+#include <seastar/core/distributed.hh>
 
 namespace redis {
 
@@ -20,6 +21,7 @@ distributed<query_processor> _the_query_processor;
 query_processor::query_processor(service::storage_proxy& proxy, data_dictionary::database db)
         : _proxy(proxy)
         , _db(db)
+        , _pending_command_gate("redis::query_processor::pending_command")
 {
 }
 

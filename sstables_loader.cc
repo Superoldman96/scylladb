@@ -639,8 +639,9 @@ public:
         // preserve the final progress, so we can access it after the task is
         // finished
         _final_progress = co_await get_progress();
-        _progress_state = progress_state::finalized;
-        co_await _progress_per_shard.stop();
+        if (std::exchange(_progress_state, progress_state::finalized) == progress_state::initialized) {
+            co_await _progress_per_shard.stop();
+        }
     }
 
     virtual future<tasks::task_manager::task::progress> get_progress() const override {
@@ -680,7 +681,7 @@ future<> sstables_loader::download_task_impl::run() {
     });
     llog.debug("Streaming sstables from {}({}/{})", _endpoint, _bucket, _prefix);
     std::exception_ptr ex;
-    gate g;
+    named_gate g("sstables_loader::download_task_impl");
     try {
         _as.check();
 

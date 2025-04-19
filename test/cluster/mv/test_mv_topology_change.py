@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 @skip_mode('release', 'error injections are not supported in release mode')
 async def test_mv_topology_change(manager: ManagerClient):
     cfg = {'force_gossip_topology_changes': True,
-           'enable_tablets': False,
+           'tablets_mode_for_new_keyspaces': 'disabled',
            'error_injections_at_startup': ['delay_before_get_view_natural_endpoint']}
 
     servers = [await manager.server_add(config=cfg) for _ in range(3)]
@@ -97,7 +97,7 @@ async def test_mv_topology_change(manager: ManagerClient):
 @pytest.mark.asyncio
 @skip_mode('release', 'error injections are not supported in release mode')
 async def test_mv_update_on_pending_replica(manager: ManagerClient, intranode):
-    cfg = {'enable_tablets': True}
+    cfg = {'tablets_mode_for_new_keyspaces': 'enabled'}
     cmd = ['--smp', '2']
     servers = [await manager.server_add(config=cfg, cmdline=cmd)]
 
@@ -177,7 +177,12 @@ async def test_mv_update_on_pending_replica(manager: ManagerClient, intranode):
 # during this time.
 @pytest.mark.asyncio
 async def test_mv_write_to_dead_node(manager: ManagerClient):
-    servers = await manager.servers_add(4)
+    servers = await manager.servers_add(4, property_file=[
+        {"dc": "dc1", "rack": "r1"},
+        {"dc": "dc1", "rack": "r2"},
+        {"dc": "dc1", "rack": "r3"},
+        {"dc": "dc1", "rack": "r3"}
+    ])
 
     cql = manager.get_cql()
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}") as ks:

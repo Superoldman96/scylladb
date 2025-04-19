@@ -63,6 +63,8 @@ public:
 
     future<> stop();
 
+    sharded<replica::database>& db() { return _db; };
+
     /**
      * Takes the snapshot for all keyspaces. A snapshot name must be specified.
      *
@@ -90,15 +92,6 @@ public:
     future<> take_column_family_snapshot(sstring ks_name, std::vector<sstring> tables, sstring tag, skip_flush sf = skip_flush::no);
 
     /**
-     * Takes the snapshot of a specific column family. A snapshot name must be specified.
-     *
-     * @param ks_name the keyspace which holds the specified column family
-     * @param cf_name the column family to snapshot
-     * @param tag the tag given to the snapshot; may not be null or empty
-     */
-    future<> take_column_family_snapshot(sstring ks_name, sstring cf_name, sstring tag, skip_flush sf = skip_flush::no);
-
-    /**
      * Remove the snapshot with the given name from the given keyspaces.
      * If no tag is specified we will remove all snapshots.
      * If a cf_name is specified, only that table will be deleted
@@ -115,7 +108,7 @@ private:
     config _config;
     sharded<replica::database>& _db;
     seastar::rwlock _lock;
-    seastar::gate _ops;
+    seastar::named_gate _ops;
     shared_ptr<snapshot::task_manager_module> _task_manager_module;
     sstables::storage_manager& _storage_manager;
 

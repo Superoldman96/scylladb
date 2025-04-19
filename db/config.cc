@@ -76,6 +76,16 @@ hinted_handoff_enabled_to_json(const db::config::hinted_handoff_enabled_type& h)
     return value_to_json(h.to_configuration_string());
 }
 
+static
+json::json_return_type
+object_storage_endpoints_to_json(const std::vector<db::object_storage_endpoint_param> &endpoints) {
+    std::unordered_map<sstring, sstring> m;
+    for (auto& e : endpoints) {
+        m[e.endpoint] = e.to_json_string();
+    }
+    return value_to_json(m);
+}
+
 // Convert a value that can be printed with fmt::format, or a vector of
 // such values, to JSON. An example is enum_option<T>, because enum_option<T>
 // has a specialization for fmt::formatter.
@@ -246,6 +256,13 @@ const config_type& config_type_for<enum_option<db::tri_mode_restriction_t>>() {
 }
 
 template <>
+const config_type& config_type_for<enum_option<db::tablets_mode_t>>() {
+    static config_type ct(
+        "tablets mode", printable_to_json<enum_option<db::tablets_mode_t>>);
+    return ct;
+}
+
+template <>
 const config_type& config_type_for<db::config::hinted_handoff_enabled_type>() {
     static config_type ct("hinted handoff enabled", hinted_handoff_enabled_to_json);
     return ct;
@@ -268,6 +285,12 @@ template <>
 const config_type& config_type_for<utils::advanced_rpc_compressor::tracker::algo_config>() {
     static config_type ct(
         "advanced rpc compressor config", printable_vector_to_json<enum_option<compression_algorithm>>);
+    return ct;
+}
+
+template <>
+const config_type& config_type_for<std::vector<db::object_storage_endpoint_param>>() {
+    static config_type ct("object storage endpoint configuration", object_storage_endpoints_to_json);
     return ct;
 }
 
@@ -379,6 +402,23 @@ public:
     }
 };
 
+template <>
+class convert<enum_option<db::tablets_mode_t>> {
+public:
+    static bool decode(const Node& node, enum_option<db::tablets_mode_t>& rhs) {
+        std::string name;
+        if (!convert<std::string>::decode(node, name)) {
+            return false;
+        }
+        try {
+            std::istringstream(name) >> rhs;
+        } catch (boost::program_options::invalid_option_value&) {
+            return false;
+        }
+        return true;
+    }
+};
+
 template<>
 struct convert<db::config::error_injection_at_startup> {
     static bool decode(const Node& node, db::config::error_injection_at_startup& rhs) {
@@ -435,6 +475,18 @@ public:
         } catch (boost::program_options::invalid_option_value&) {
             return false;
         }
+        return true;
+    }
+};
+
+template<>
+struct convert<db::object_storage_endpoint_param> {
+    static bool decode(const Node& node, db::object_storage_endpoint_param& ep) {
+        ep.endpoint = node["name"].as<std::string>();
+        ep.config.port = node["port"].as<unsigned>();
+        ep.config.use_https = node["https"].as<bool>(false);
+        ep.config.region = node["aws_region"] ? node["aws_region"].as<std::string>() : std::getenv("AWS_DEFAULT_REGION");
+        ep.config.role_arn = node["iam_role_arn"] ? node["iam_role_arn"].as<std::string>() : "";
         return true;
     }
 };
@@ -890,6 +942,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "The default timeout for other, miscellaneous operations.\n"
         "\n"
         "Related information: About hinted handoff writes")
+    , group0_raft_op_timeout_in_ms(this, "group0_raft_op_timeout_in_ms", liveness::LiveUpdate, value_status::Used, 60000,
+            "The time in milliseconds that group0 allows a Raft operation to complete.")
     /**
     * @Group Inter-node settings
     */
@@ -1189,8 +1243,21 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , enable_sstables_mc_format(this, "enable_sstables_mc_format", value_status::Unused, true, "Enable SSTables 'mc' format to be used as the default file format.  Deprecated, please use \"sstable_format\" instead.")
     , enable_sstables_md_format(this, "enable_sstables_md_format", value_status::Unused, true, "Enable SSTables 'md' format to be used as the default file format.  Deprecated, please use \"sstable_format\" instead.")
     , sstable_format(this, "sstable_format", value_status::Used, "me", "Default sstable file format", {"md", "me"})
+    , sstable_compression_dictionaries_enable_writing(this, "sstable_compression_dictionaries_enable_writing", liveness::LiveUpdate, value_status::Used, true,
+        "Enables SSTable compression with shared dictionaries (for tables which opt in). If set to false, this node won't write any new SSTables using dictionary compression.\n"
+        "Option meant not for regular usage, but for unforeseen problems that call for disabling dictionaries without modifying table schema.")
+    , sstable_compression_dictionaries_memory_budget_fraction(this, "sstable_compression_dictionaries_memory_budget_fraction", liveness::LiveUpdate, value_status::Used, 0.01,
+        "Fall back to compression without dictionaries if RAM usage by dictionaries is greater or equal to this fraction of the shard's memory.")
+    , sstable_compression_dictionaries_retrain_period_in_seconds(this, "sstable_compression_dictionaries_retrain_period_in_seconds", liveness::LiveUpdate, value_status::Used, 86400,
+        "Minimum age of the current compression dictionary before another dictionary for this table is trained.")
+    , sstable_compression_dictionaries_autotrainer_tick_period_in_seconds(this, "sstable_compression_dictionaries_autotrainer_tick_period_in_seconds", liveness::LiveUpdate, value_status::Used, 900,
+        "The period with which automatic dictionary training is attempted.")
+    , sstable_compression_dictionaries_min_training_dataset_bytes(this, "sstable_compression_dictionaries_min_training_dataset_bytes", liveness::LiveUpdate, value_status::Used, 1*1024*1024*1024,
+        "The minimum size a table has to reach before dictionaries will be trained for it.")
+    , sstable_compression_dictionaries_min_training_improvement_factor(this, "sstable_compression_dictionaries_min_training_improvement_factor", liveness::LiveUpdate, value_status::Used, 0.95,
+        "New dictionaries will be only published if the estimated compression ratio is smaller than current ratio multiplied by this factor.")
     , uuid_sstable_identifiers_enabled(this,
-            "uuid_sstable_identifiers_enabled", liveness::LiveUpdate, value_status::Used, true, "If set to true, each newly created sstable will have a UUID "
+            "uuid_sstable_identifiers_enabled", value_status::Unused, true, "If set to true, each newly created sstable will have a UUID "
             "based generation identifier, and such files are not readable by previous Scylla versions.")
     , table_digest_insensitive_to_expiry(this, "table_digest_insensitive_to_expiry", liveness::MustRestart, value_status::Used, true,
             "When enabled, per-table schema digest calculation ignores empty partitions.")
@@ -1241,6 +1308,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Time period in seconds after which unused schema versions will be evicted from the local schema registry cache. Default is 1 second.")
     , max_concurrent_requests_per_shard(this, "max_concurrent_requests_per_shard", liveness::LiveUpdate, value_status::Used, std::numeric_limits<uint32_t>::max(),
         "Maximum number of concurrent requests a single shard can handle before it starts shedding extra load. By default, no requests will be shed.")
+    , uninitialized_connections_semaphore_cpu_concurrency(this, "uninitialized_connections_semaphore_cpu_concurrency", liveness::LiveUpdate, value_status::Used, 8,
+        "Maximum number of new concurrent connections from drivers that a single shard can be processing before it starts throttling incomming connections. This limit applies only to new connections excluding the ones blocked on network IO; connections that are ready to serve requests are not affected. By default the limit is 8.")
     , cdc_dont_rewrite_streams(this, "cdc_dont_rewrite_streams", value_status::Used, false,
             "Disable rewriting streams from cdc_streams_descriptions to cdc_streams_descriptions_v2. Should not be necessary, but the procedure is expensive and prone to failures; this config option is left as a backdoor in case some user requires manual intervention.")
     , strict_allow_filtering(this, "strict_allow_filtering", liveness::LiveUpdate, value_status::Used, strict_allow_filtering_default(), "Match Cassandra in requiring ALLOW FILTERING on slow queries. Can be true, false, or warn. When false, Scylla accepts some slow queries even without ALLOW FILTERING that Cassandra rejects. Warn is same as false, but with warning.")
@@ -1282,6 +1351,9 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "the same endpoint used in the request. The string 'disabled' "
         "disables the DescribeEndpoints operation. Any other string is the "
         "fixed value that will be returned by DescribeEndpoints operations.")
+    // alternator_max_items_in_batch_write matches DynamoDB behaviour of size limit, but with different value - for DynamoDB it's 25
+    // (see DynamoDB's documentation for BatchWriteItem command)
+    , alternator_max_items_in_batch_write(this, "alternator_max_items_in_batch_write", value_status::Used, 100, "Maximum amount of items in single BatchItemWrite call.")
     , abort_on_ebadf(this, "abort_on_ebadf", value_status::Used, true, "Abort the server on incorrect file descriptor access. Throws exception when disabled.")
     , redis_port(this, "redis_port", value_status::Used, 0, "Port on which the REDIS transport listens for clients.")
     , redis_ssl_port(this, "redis_ssl_port", value_status::Used, 0, "Port on which the REDIS TLS native transport listens for clients.")
@@ -1328,7 +1400,6 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , wasm_udf_total_fuel(this, "wasm_udf_total_fuel", value_status::Used, 100000000, "Wasmtime fuel a WASM UDF can consume before termination.")
     , wasm_udf_memory_limit(this, "wasm_udf_memory_limit", value_status::Used, 2*1024*1024, "How much memory each WASM UDF can allocate at most.")
     , relabel_config_file(this, "relabel_config_file", value_status::Used, "", "Optionally, read relabel config from file.")
-    , object_storage_config_file(this, "object_storage_config_file", value_status::Used, "", "Optionally, read object-storage endpoints config from file.")
     , live_updatable_config_params_changeable_via_cql(this, "live_updatable_config_params_changeable_via_cql", liveness::MustRestart, value_status::Used, true, "If set to true, configuration parameters defined with LiveUpdate can be updated in runtime via CQL (by updating system.config virtual table), otherwise they can't.")
     , auth_superuser_name(this, "auth_superuser_name", value_status::Used, "",
         "Initial authentication super username. Ignored if authentication tables already contain a super user.")
@@ -1369,10 +1440,14 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , ldap_bind_dn(this, "ldap_bind_dn", value_status::Used, "", "Distinguished name used by LDAPRoleManager for binding to LDAP server.")
     , ldap_bind_passwd(this, "ldap_bind_passwd", value_status::Used, "", "Password used by LDAPRoleManager for binding to LDAP server.")
     , saslauthd_socket_path(this, "saslauthd_socket_path", value_status::Used, "", "UNIX domain socket on which saslauthd is listening.")
-
+    , object_storage_endpoints(this, "object_storage_endpoints", liveness::LiveUpdate, value_status::Used, {}, "Object storage endpoints configuration.")
     , error_injections_at_startup(this, "error_injections_at_startup", error_injection_value_status, {}, "List of error injections that should be enabled on startup.")
     , topology_barrier_stall_detector_threshold_seconds(this, "topology_barrier_stall_detector_threshold_seconds", value_status::Used, 2, "Report sites blocking topology barrier if it takes longer than this.")
-    , enable_tablets(this, "enable_tablets", value_status::Used, false, "Enable tablets for newly created keyspaces.")
+    , enable_tablets(this, "enable_tablets", value_status::Used, false, "Enable tablets for newly created keyspaces. (deprecated)")
+    , tablets_mode_for_new_keyspaces(this, "tablets_mode_for_new_keyspaces", value_status::Used, tablets_mode_t::mode::unset, "Control tablets for new keyspaces.  Can be set to the following values:\n"
+            "\tdisabled: New keyspaces use vnodes by default, unless enabled by the tablets={'enabled':true} option\n"
+            "\tenabled:  New keyspaces use tablets by default, unless disabled by the tablets={'disabled':true} option\n"
+            "\tenforced: New keyspaces must use tablets. Tablets cannot be disabled using the CREATE KEYSPACE option")
     , view_flow_control_delay_limit_in_ms(this, "view_flow_control_delay_limit_in_ms", liveness::LiveUpdate, value_status::Used, 1000,
         "The maximal amount of time that materialized-view update flow control may delay responses "
         "to try to slow down the client and prevent buildup of unfinished view updates. "
@@ -1481,12 +1556,25 @@ std::istream& operator>>(std::istream& is, error_injection_at_startup& eias) {
     return is;
 }
 
+
+std::istream& operator>>(std::istream& is, object_storage_endpoint_param& f) {
+    // FIXME -- this operator is used, in particular, by boost lexical_cast<>
+    // it's here just to make the code compile, but it's not yet called for real
+    throw std::runtime_error("reading object_storage_endpoint_param from istream is not implemented");
+    return is;
+}
+
 }
 
 auto fmt::formatter<db::error_injection_at_startup>::format(const db::error_injection_at_startup& eias, fmt::format_context& ctx) const
     -> decltype(ctx.out()) {
     return fmt::format_to(ctx.out(), "error_injection_at_startup{{name={}, one_short={}, parameters={}}}",
                           eias.name, eias.one_shot, eias.parameters);
+}
+
+auto fmt::formatter<db::object_storage_endpoint_param>::format(const db::object_storage_endpoint_param& e, fmt::format_context& ctx) const
+    -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "object_storage_endpoint_param{{}}", e.to_json_string());
 }
 
 namespace utils {
@@ -1610,6 +1698,16 @@ std::unordered_map<sstring, db::tri_mode_restriction_t::mode> db::tri_mode_restr
             {"false", db::tri_mode_restriction_t::mode::FALSE},
             {"0", db::tri_mode_restriction_t::mode::FALSE},
             {"warn", db::tri_mode_restriction_t::mode::WARN}};
+}
+
+std::unordered_map<sstring, db::tablets_mode_t::mode> db::tablets_mode_t::map() {
+    return {{"disabled", db::tablets_mode_t::mode::disabled},
+            {"0", db::tablets_mode_t::mode::disabled},
+            {"enabled", db::tablets_mode_t::mode::enabled},
+            {"1", db::tablets_mode_t::mode::enabled},
+            {"enforced", db::tablets_mode_t::mode::enforced},
+            {"2", db::tablets_mode_t::mode::enforced}
+            };
 }
 
 template struct utils::config_file::named_value<seastar::log_level>;

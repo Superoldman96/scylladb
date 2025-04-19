@@ -13,7 +13,8 @@ namespace s3 {
 class client;
 
 struct upload_progress {
-    size_t total;
-    size_t uploaded;
+    size_t total = 0;
+    size_t uploaded = 0;
+    upload_progress operator+(const upload_progress& other) const { return {total + other.total, uploaded + other.uploaded}; }
 };
 }

@@ -57,7 +57,7 @@ private:
         auto permit = semaphore.make_permit();
         std::vector<mutation_reader> readers;
         for (auto&& mt : _memtables) {
-            readers.push_back(mt->make_flat_reader(new_mt->schema(),
+            readers.push_back(mt->make_mutation_reader(new_mt->schema(),
                  permit,
                  query::full_partition_range,
                  new_mt->schema()->full_slice(),
@@ -78,6 +78,7 @@ private:
 public:
     memtable_snapshot_source(schema_ptr s)
         : _s(s)
+        , _apply("memtable_snapshot_source::apply")
         , _compactor(seastar::async([this] () noexcept {
             while (!_closed) {
                 std::optional<future<>> f;

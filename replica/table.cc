@@ -54,8 +54,8 @@
 #include "locator/tablets.hh"
 
 #include "utils/error_injection.hh"
-#include "readers/reversing_v2.hh"
-#include "readers/empty_v2.hh"
+#include "readers/reversing.hh"
+#include "readers/empty.hh"
 #include "readers/multi_range.hh"
 #include "readers/combined.hh"
 #include "readers/compacting.hh"
@@ -182,7 +182,7 @@ table::add_memtables_to_reader_list(std::vector<mutation_reader>& readers,
         std::function<void(size_t)> reserve_fn) const {
     auto add_memtables_from_cg = [&] (compaction_group& cg) mutable {
         for (auto&& mt: *cg.memtables()) {
-            if (auto reader_opt = mt->make_flat_reader_opt(s, permit, range, slice, trace_state, fwd, fwd_mr)) {
+            if (auto reader_opt = mt->make_mutation_reader_opt(s, permit, range, slice, trace_state, fwd, fwd_mr)) {
                 readers.emplace_back(std::move(*reader_opt));
             }
         }
@@ -246,7 +246,8 @@ table::make_reader_v2(schema_ptr s,
 
     const auto bypass_cache = slice.options.contains(query::partition_slice::option::bypass_cache);
     if (cache_enabled() && !bypass_cache) {
-        if (auto reader_opt = _cache.make_reader_opt(s, permit, range, slice, &_compaction_manager.get_tombstone_gc_state(), std::move(trace_state), fwd, fwd_mr)) {
+        if (auto reader_opt = _cache.make_reader_opt(s, permit, range, slice, &_compaction_manager.get_tombstone_gc_state(),
+                    get_max_purgeable_fn_for_cache_underlying_reader(), std::move(trace_state), fwd, fwd_mr)) {
             readers.emplace_back(std::move(*reader_opt));
         }
     } else {
@@ -872,7 +873,9 @@ bool table::uses_tablets() const {
 }
 
 storage_group::storage_group(compaction_group_ptr cg)
-        : _main_cg(std::move(cg)) {
+        : _main_cg(cg)
+        , _async_gate(format("[storage_group {}.{} {}]", cg->as_table_state().schema()->ks_name(), cg->as_table_state().schema()->cf_name(), cg->group_id()))
+{
 }
 
 const dht::token_range& storage_group::token_range() const noexcept {
@@ -1248,14 +1251,6 @@ const storage_group_map& table::storage_groups() const {
     return _sg_manager->storage_groups();
 }
 
-future<> table::safe_foreach_sstable(const sstables::sstable_set& set, noncopyable_function<future<>(const sstables::shared_sstable&)> action) {
-    auto deletion_guard = co_await get_sstable_list_permit();
-
-    co_await set.for_each_sstable_gently([&] (const sstables::shared_sstable& sst) -> future<> {
-        return action(sst);
-    });
-}
-
 future<utils::chunked_vector<sstables::sstable_files_snapshot>> table::take_storage_snapshot(dht::token_range tr) {
     utils::chunked_vector<sstables::sstable_files_snapshot> ret;
 
@@ -1268,9 +1263,11 @@ future<utils::chunked_vector<sstables::sstable_files_snapshot>> table::take_stor
 
         co_await cg->flush();
 
-        auto set = cg->make_sstable_set();
-
-        co_await safe_foreach_sstable(*set, [&] (const sstables::shared_sstable& sst) -> future<> {
+        // The sstable set must be obtained *after* the deletion lock is taken,
+        // otherwise components of sstables in the set might be unlinked from the filesystem
+        // by compaction while we are waiting for the lock.
+        auto deletion_guard = co_await get_sstable_list_permit();
+        co_await cg->make_sstable_set()->for_each_sstable_gently([&] (const sstables::shared_sstable& sst) -> future<> {
            ret.push_back({
                .sst = sst,
                .files = co_await sst->readable_file_for_all_components(),
@@ -1281,6 +1278,15 @@ future<utils::chunked_vector<sstables::sstable_files_snapshot>> table::take_stor
     co_return std::move(ret);
 }
 
+future<utils::chunked_vector<sstables::shared_sstable>> table::take_sstable_set_snapshot() {
+    auto deletion_guard = co_await get_sstable_list_permit();
+    utils::chunked_vector<sstables::shared_sstable> result;
+    co_await get_sstable_set().for_each_sstable_gently([&] (sstables::shared_sstable sst) {
+        result.push_back(sst);
+    });
+    co_return result;
+}
+
 future<utils::chunked_vector<sstables::entry_descriptor>>
 table::clone_tablet_storage(locator::tablet_id tid) {
     utils::chunked_vector<sstables::entry_descriptor> ret;
@@ -1289,8 +1295,11 @@ table::clone_tablet_storage(locator::tablet_id tid) {
     auto& sg = storage_group_for_id(tid.value());
     auto sg_holder = sg.async_gate().hold();
     co_await sg.flush();
-    auto set = sg.make_sstable_set();
-    co_await safe_foreach_sstable(*set, [&] (const sstables::shared_sstable& sst) -> future<> {
+    // The sstable set must be obtained *after* the deletion lock is taken,
+    // otherwise components of sstables in the set might be unlinked from the filesystem
+    // by compaction while we are waiting for the lock.
+    auto deletion_guard = co_await get_sstable_list_permit();
+    co_await sg.make_sstable_set()->for_each_sstable_gently([&] (const sstables::shared_sstable& sst) -> future<> {
         ret.push_back(co_await sst->clone(calculate_generation_for_new_table()));
     });
     co_return ret;
@@ -1529,6 +1538,7 @@ table::seal_active_memtable(compaction_group& cg, flush_permit&& flush_permit) n
         });
 
         cg.memtables()->add_memtable();
+        _highest_flushed_rp = std::max(_highest_flushed_rp, old->replay_position());
 
         // no exceptions allowed (nor expected) from this point on
         _stats.memtable_switch_count++;
@@ -1656,6 +1666,17 @@ table::try_flush_memtable_to_sstable(compaction_group& cg, lw_shared_ptr<memtabl
                 co_await with_scheduling_group(_config.memtable_to_cache_scheduling_group, [this, old, &newtabs, &cg] {
                     return update_cache(cg, old, newtabs);
                 });
+
+                co_await utils::get_local_injector().inject("replica_post_flush_after_update_cache", [this] (auto& handler) -> future<> {
+                    const auto this_table_name = format("{}.{}", _schema->ks_name(), _schema->cf_name());
+                    if (this_table_name == handler.get("table_name")) {
+                        tlogger.info("error injection handler replica_post_flush_after_update_cache: suspending flush for table {}", this_table_name);
+                        handler.set("suspended", true);
+                        co_await handler.wait_for_message(std::chrono::steady_clock::now() + std::chrono::minutes{5});
+                        tlogger.info("error injection handler replica_post_flush_after_update_cache: resuming flush for table {}", this_table_name);
+                    }
+                });
+
                 cg.memtables()->erase(old);
                 tlogger.debug("Memtable for {}.{} replaced, into {} sstables", old->schema()->ks_name(), old->schema()->cf_name(), newtabs.size());
                 co_return;
@@ -2410,6 +2431,7 @@ compaction_group::compaction_group(table& t, size_t group_id, dht::token_range t
     , _memtables(_t._config.enable_disk_writes ? _t.make_memtable_list(*this) : _t.make_memory_only_memtable_list())
     , _main_sstables(make_lw_shared<sstables::sstable_set>(t._compaction_strategy.make_sstable_set(t.schema())))
     , _maintenance_sstables(t.make_maintenance_sstable_set())
+    , _async_gate(format("[compaction_group {}.{} {}]", t.schema()->ks_name(), t.schema()->cf_name(), group_id))
 {
     _t._compaction_manager.add(as_table_state());
 }
@@ -2467,13 +2489,20 @@ table::table(schema_ptr schema, config config, lw_shared_ptr<const storage_optio
     , _compaction_strategy(make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
     , _sg_manager(make_storage_group_manager())
     , _sstables(make_compound_sstable_set())
+    , _sstable_deletion_gate(format("[table {}.{}] sstable_deletion_gate", _schema->ks_name(), _schema->cf_name()))
     , _cache(_schema, sstables_as_snapshot_source(), row_cache_tracker, is_continuous::yes)
     , _commitlog(nullptr)
     , _readonly(true)
     , _durable_writes(true)
     , _sstables_manager(sst_manager)
     , _index_manager(this->as_data_dictionary())
+    , _flush_barrier(format("[table {}.{}] flush_barrier", _schema->ks_name(), _schema->cf_name()))
     , _counter_cell_locks(_schema->is_counter() ? std::make_unique<cell_locker>(_schema, cl_stats) : nullptr)
+    , _async_gate(format("[table {}.{}] async_gate", _schema->ks_name(), _schema->cf_name()))
+    , _pending_writes_phaser(format("[table {}.{}] pending_writes", _schema->ks_name(), _schema->cf_name()))
+    , _pending_reads_phaser(format("[table {}.{}] pending_reads", _schema->ks_name(), _schema->cf_name()))
+    , _pending_streams_phaser(format("[table {}.{}] pending_streams", _schema->ks_name(), _schema->cf_name()))
+    , _pending_flushes_phaser(format("[table {}.{}] pending_flushes", _schema->ks_name(), _schema->cf_name()))
     , _row_locker(_schema)
     , _flush_timer([this]{ on_flush_timer(); })
     , _off_strategy_trigger([this] { trigger_offstrategy_compaction(); })
@@ -2762,20 +2791,7 @@ max_purgeable_fn table::get_max_purgeable_fn_for_cache_underlying_reader() const
         auto max_purgeable_timestamp = api::max_timestamp;
 
         sg.for_each_compaction_group([&dk, is_shadowable, &max_purgeable_timestamp] (const compaction_group_ptr& cg) {
-            const auto& mt = cg->memtables()->active_memtable();
-            // see get_max_purgeable_timestamp() in compaction.cc for comments on choosing min timestamp
-            api::timestamp_type memtable_min_timestamp = is_shadowable ? mt.get_min_live_row_marker_timestamp() : mt.get_min_live_timestamp();
-            if (memtable_min_timestamp > cg->max_seen_timestamp()) {
-                // All the entries in the memtable are newer than the entries in the
-                // SSTable within this compaction group. So, no need to check further.
-                return;
-            }
-
-            // If a memtable with a minimum timestamp lower than the current maximum
-            // purgeable timestamp has the given key, the tombstone should not be purged.
-            if (memtable_min_timestamp < max_purgeable_timestamp && mt.contains_partition(dk)) {
-                max_purgeable_timestamp = memtable_min_timestamp;
-            }
+            max_purgeable_timestamp = std::min(cg->memtables()->min_live_timestamp(dk, is_shadowable, cg->max_seen_timestamp()), max_purgeable_timestamp);
         });
 
         return max_purgeable_timestamp;
@@ -2821,6 +2837,9 @@ logalloc::occupancy_stats table::occupancy() const {
     return res;
 }
 
+db::replay_position table::highest_flushed_replay_position() const {
+    return _highest_flushed_rp;
+}
 
 future<>
 table::seal_snapshot(sstring jsondir, std::vector<snapshot_file_set> file_sets) {
@@ -3439,10 +3458,6 @@ db::replay_position table::set_low_replay_position_mark() {
 
 template<typename... Args>
 void table::do_apply(compaction_group& cg, db::rp_handle&& h, Args&&... args) {
-    if (cg.async_gate().is_closed()) [[unlikely]] {
-        on_internal_error(tlogger, "async_gate of table's compaction group is closed");
-    }
-
     utils::latency_counter lc;
     _stats.writes.set_latency(lc);
     db::replay_position rp = h;

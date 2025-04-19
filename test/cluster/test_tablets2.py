@@ -9,7 +9,7 @@ from test.pylib.internal_types import HostID, ServerInfo, ServerNum
 from test.pylib.manager_client import ManagerClient
 from test.pylib.rest_client import inject_error_one_shot, HTTPError, read_barrier
 from test.pylib.util import wait_for_cql_and_get_hosts, unique_name
-from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas
+from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas, TabletReplicas
 from test.cluster.conftest import skip_mode
 from test.cluster.util import reconnect_driver, create_new_test_keyspace, new_test_keyspace
 
@@ -844,7 +844,7 @@ async def test_tablet_cleanup_failure(manager: ManagerClient):
 @pytest.mark.asyncio
 async def test_tablet_resharding(manager: ManagerClient):
     cmdline = ['--smp=3']
-    config = {'enable_tablets': True}
+    config = {'tablets_mode_for_new_keyspaces': 'enabled'}
     servers = await manager.servers_add(1, cmdline=cmdline)
     server = servers[0]
 
@@ -1835,3 +1835,81 @@ async def test_tablet_cleanup_vs_snapshot_race(manager: ManagerClient):
         await s0_log.wait_for('Cleanup failed for tablet', from_mark=s0_mark)
 
         await manager.api.take_snapshot(servers[0].ip_addr, ks, "test_snapshot")
+
+# Reproduces assert failure when truncating table, either triggered by DROP TABLE or TRUNCATE.
+# See: https://github.com/scylladb/scylladb/issues/18059
+# It's achieved by migrating a tablet away that contains the highest replay position of a shard,
+# so when drop/truncate happens, the highest replay position will be greater than all the data
+# found in the table (includes data in memtable).
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ['DROP TABLE', 'TRUNCATE'])
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_drop_table_and_truncate_after_migration(manager: ManagerClient, operation):
+    cmdline = [ '--smp=2' ]
+    cfg = { 'auto_snapshot': True }
+    servers = [await manager.server_add(cmdline=cmdline, config=cfg)]
+
+    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+
+    cql = manager.get_cql()
+    ks = await create_new_test_keyspace(cql, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND TABLETS = {{'initial': 4}}")
+    await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+
+    await manager.api.disable_autocompaction(servers[0].ip_addr, ks)
+
+    keys = range(100)
+    await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
+
+    tablet_replicas = await get_all_tablet_replicas(manager, servers[0], ks, 'test')
+    tablet_replicas_in_s0 = list[TabletReplicas]()
+
+    for replica in tablet_replicas:
+        if replica.replicas[0][1] == 0:
+            tablet_replicas_in_s0.append(replica)
+
+    assert len(tablet_replicas_in_s0) == 2
+
+    target_tablet = tablet_replicas_in_s0[0]
+
+    s0_host_id = await manager.get_host_id(servers[0].server_id)
+
+    logger.info("Migrating 1st tablet to shard 1")
+    await manager.api.move_tablet(servers[0].ip_addr, ks, "test", *(s0_host_id, 0), *(s0_host_id, 1), target_tablet.last_token)
+
+    await manager.api.enable_injection(servers[0].ip_addr, "truncate_disable_compaction_delay", one_shot=True)
+
+    logger.info(f"Running {operation} {ks}.test")
+    await cql.run_async(f"{operation} {ks}.test")
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_truncate_during_topology_change(manager: ManagerClient):
+    """Test truncate operation during topology change."""
+
+    # Start 3 node cluster
+    servers = await manager.servers_add(3, config = { 'enable_tablets': True })
+    cql = manager.get_cql()
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (k int PRIMARY KEY, v int)")
+
+        logger.info("Populating table")
+        stmt = cql.prepare(f"INSERT INTO {ks}.test (k, v) VALUES (?, ?)")
+        stmt.consistency_level = ConsistencyLevel.QUORUM
+        await asyncio.gather(*(cql.run_async(stmt, [k, k]) for k in range(10000)))
+        await manager.api.keyspace_flush(servers[0].ip_addr, ks, "test")
+
+        async def truncate_table():
+            await asyncio.sleep(10)
+            logger.info("Executing truncate during bootstrap")
+            await cql.run_async(f"TRUNCATE {ks}.test USING TIMEOUT 1m")
+
+        truncate_task = asyncio.create_task(truncate_table())
+        logger.info("Adding fourth node")
+        new_server = await manager.server_add(config={'error_injections_at_startup': ['delay_bootstrap_120s'], 'enable_tablets': True})
+        await truncate_task
+
+        # Wait for bootstrap completion
+        await wait_for_cql_and_get_hosts(cql, servers + [new_server], time.time() + 60)
+
+        rows = await cql.run_async(f"SELECT COUNT(*) FROM {ks}.test")
+        assert rows[0].count == 0, "Table should be empty after truncation"

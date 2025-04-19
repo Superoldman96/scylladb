@@ -2022,15 +2022,15 @@ future<std::vector<locator::host_id>> system_keyspace::load_peers_ids() {
     co_return ret;
 }
 
-future<std::unordered_map<gms::inet_address, sstring>> system_keyspace::load_peer_features() {
+future<std::unordered_map<locator::host_id, sstring>> system_keyspace::load_peer_features() {
     co_await peers_table_read_fixup();
 
-    const sstring req = format("SELECT peer, supported_features FROM system.{}", PEERS);
-    std::unordered_map<gms::inet_address, sstring> ret;
+    const sstring req = format("SELECT host_id, supported_features FROM system.{}", PEERS);
+    std::unordered_map<locator::host_id, sstring> ret;
     const auto cql_result = co_await execute_cql(req);
     for (const auto& row : *cql_result) {
         if (row.has("supported_features")) {
-            ret.emplace(row.get_as<net::inet_address>("peer"),
+            ret.emplace(locator::host_id(row.get_as<utils::UUID>("host_id")),
                     row.get_as<sstring>("supported_features"));
         }
     }
@@ -3461,17 +3461,17 @@ future<system_keyspace::topology_requests_entries> system_keyspace::get_node_ops
 }
 
 future<mutation> system_keyspace::get_insert_dict_mutation(
+    std::string_view name,
     bytes data,
     locator::host_id host_id,
     db_clock::time_point dict_ts,
     api::timestamp_type write_ts
 ) const {
-    const char* dict_name = "general";
-    slogger.debug("Publishing new compression dictionary: {} {} {}", dict_name, dict_ts, host_id);
+    slogger.debug("Publishing new compression dictionary: {} {} {}", name, dict_ts, host_id);
 
     static sstring insert_new = format("INSERT INTO {}.{} (name, timestamp, origin, data) VALUES (?, ?, ?, ?);", NAME, DICTS);
     auto muts = co_await _qp.get_mutations_internal(insert_new, internal_system_query_state(), write_ts, {
-        data_value(dict_name),
+        data_value(name),
         data_value(dict_ts),
         data_value(host_id.uuid()),
         data_value(std::move(data)),
@@ -3482,10 +3482,30 @@ future<mutation> system_keyspace::get_insert_dict_mutation(
     co_return std::move(muts[0]);
 }
 
-future<utils::shared_dict> system_keyspace::query_dict() const {
+mutation system_keyspace::get_delete_dict_mutation(std::string_view name, api::timestamp_type write_ts) {
+    auto s = db::system_keyspace::dicts();
+    mutation m(s, partition_key::from_single_value(*s,
+        data_value(name).serialize_nonnull()
+    ));
+    m.partition().apply(tombstone(write_ts, gc_clock::now()));
+    return m;
+}
+
+future<std::vector<sstring>> system_keyspace::query_all_dict_names() const {
+    std::vector<sstring> result;
+    sstring query = format("SELECT name from {}.{}", NAME, DICTS);
+    auto rs = co_await _qp.execute_internal(
+        query, db::consistency_level::ONE, internal_system_query_state(), {}, cql3::query_processor::cache_internal::yes);
+    for (const auto& row : *rs) {
+        result.push_back(row.get_as<sstring>("name"));
+    }
+    co_return result;
+}
+
+future<utils::shared_dict> system_keyspace::query_dict(std::string_view name) const {
     static sstring query = format("SELECT * FROM {}.{} WHERE name = ?;", NAME, DICTS);
     auto result_set = co_await _qp.execute_internal(
-        query, db::consistency_level::ONE, internal_system_query_state(), {"general"}, cql3::query_processor::cache_internal::yes);
+        query, db::consistency_level::ONE, internal_system_query_state(), {name}, cql3::query_processor::cache_internal::yes);
     if (!result_set->empty()) {
         auto &&row = result_set->one();
         auto content = row.get_as<bytes>("data");
@@ -3500,6 +3520,19 @@ future<utils::shared_dict> system_keyspace::query_dict() const {
         );
     } else {
         co_return utils::shared_dict();
+    }
+}
+
+future<std::optional<db_clock::time_point>> system_keyspace::query_dict_timestamp(std::string_view name) const {
+    static sstring query = format("SELECT timestamp FROM {}.{} WHERE name = ?;", NAME, DICTS);
+    auto result_set = co_await _qp.execute_internal(
+        query, db::consistency_level::ONE, internal_system_query_state(), {name}, cql3::query_processor::cache_internal::yes);
+    if (!result_set->empty()) {
+        auto &&row = result_set->one();
+        auto timestamp = row.get_as<db_clock::time_point>("timestamp");
+        co_return timestamp;
+    } else {
+        co_return std::nullopt;
     }
 }
 

@@ -238,7 +238,7 @@ SEASTAR_TEST_CASE(check_statistics_func) {
 SEASTAR_TEST_CASE(check_toc_func) {
     auto s = make_schema_for_compressed_sstable();
     return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", [] (shared_sstable sst1, shared_sstable sst2) {
-        sst2->read_toc().get();
+        sstables::test(sst2).read_toc().get();
         auto& sst1_c = sstables::test(sst1).get_components();
         auto& sst2_c = sstables::test(sst2).get_components();
 
@@ -649,7 +649,7 @@ SEASTAR_TEST_CASE(test_skipping_in_compressed_stream) {
         sstables::compression c;
         // this initializes "c"
         auto os = make_file_output_stream(f, file_output_stream_options()).get();
-        auto out = make_compressed_file_m_format_output_stream(std::move(os), &c, cp);
+        auto out = make_compressed_file_m_format_output_stream(std::move(os), &c, cp, make_lz4_sstable_compressor_for_tests());
 
         // Make sure that amount of written data is a multiple of chunk_len so that we hit #2143.
         temporary_buffer<char> buf1(c.uncompressed_chunk_length());

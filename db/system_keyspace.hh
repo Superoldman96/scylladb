@@ -497,7 +497,7 @@ public:
      */
     future<std::unordered_set<dht::token>> get_local_tokens();
 
-    future<std::unordered_map<gms::inet_address, sstring>> load_peer_features();
+    future<std::unordered_map<locator::host_id, sstring>> load_peer_features();
     future<std::set<sstring>> load_local_enabled_features();
     // This function stores the features in the system.scylla_local table.
     // We pass visible_before_cl_replay=true iff the features should be available before
@@ -661,9 +661,12 @@ public:
     // Publishes a new compression dictionary to `dicts`,
     // with the current timestamp.
     future<mutation> get_insert_dict_mutation(
-            bytes dict, locator::host_id self, db_clock::time_point dict_ts, api::timestamp_type write_ts) const;
+            std::string_view name, bytes dict, locator::host_id self, db_clock::time_point dict_ts, api::timestamp_type write_ts) const;
+    static mutation get_delete_dict_mutation(std::string_view name, api::timestamp_type write_ts);
     // Queries `dicts` for the most recent compression dictionary.
-    future<utils::shared_dict> query_dict() const;
+    future<utils::shared_dict> query_dict(std::string_view name) const;
+    future<std::optional<db_clock::time_point>> query_dict_timestamp(std::string_view name) const;
+    future<std::vector<sstring>> query_all_dict_names() const;
 
 private:
     static std::optional<service::topology_features> decode_topology_features_state(::shared_ptr<cql3::untyped_result_set> rs);

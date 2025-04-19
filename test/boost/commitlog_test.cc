@@ -295,7 +295,7 @@ SEASTAR_TEST_CASE(test_commitlog_closed) {
             return log.add_mutation(uuid, tmp.size(), db::commitlog::force_sync::no, [tmp](db::commitlog::output& dst) {
                 dst.write(tmp.data(), tmp.size());
             }).then_wrapped([] (future<db::rp_handle> f) {
-                BOOST_REQUIRE_EXCEPTION(f.get(), gate_closed_exception, exception_predicate::message_equals("gate closed"));
+                BOOST_REQUIRE_EXCEPTION(f.get(), gate_closed_exception, exception_predicate::message_contains("gate closed"));
             });
         });
     });
@@ -962,7 +962,7 @@ SEASTAR_TEST_CASE(test_commitlog_replay_invalid_key){
             readers.reserve(memtables.size());
             auto permit = db.get_reader_concurrency_semaphore().make_tracking_only_permit(s, "test", db::no_timeout, {});
             for (auto mt : memtables) {
-                readers.push_back(mt->make_flat_reader(s, permit));
+                readers.push_back(mt->make_mutation_reader(s, permit));
             }
             auto rd = make_combined_reader(s, permit, std::move(readers));
             auto close_rd = deferred_close(rd);

@@ -7,6 +7,7 @@ import pytest
 import time
 import random
 
+from test.pylib.minio_server import MinioServer
 from test.pylib.manager_client import ManagerClient
 from test.cluster.object_store.conftest import get_s3_resource, format_tuples
 from test.cluster.conftest import skip_mode
@@ -52,8 +53,9 @@ async def prepare_snapshot_for_backup(manager: ManagerClient, server, snap_name=
 async def test_simple_backup(manager: ManagerClient, s3_server):
     '''check that backing up a snapshot for a keyspace works'''
 
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
@@ -92,8 +94,9 @@ async def test_simple_backup(manager: ManagerClient, s3_server):
 async def test_backup_move(manager: ManagerClient, s3_server, move_files):
     '''check that backing up a snapshot by _moving_ sstable to object storage'''
 
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
@@ -125,8 +128,9 @@ async def test_backup_move(manager: ManagerClient, s3_server, move_files):
 async def test_backup_to_non_existent_bucket(manager: ManagerClient, s3_server):
     '''backup should fail if the destination bucket does not exist'''
 
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
@@ -144,14 +148,41 @@ async def test_backup_to_non_existent_bucket(manager: ManagerClient, s3_server):
     status = await manager.api.wait_task(server.ip_addr, tid)
     assert status is not None
     assert status['state'] == 'failed'
+    assert 'S3 request failed. Code: 15. Reason: Access Denied.' in status['error']
 
+
+async def test_backup_to_non_existent_endpoint(manager: ManagerClient, s3_server):
+    '''backup should fail if the endpoint is invalid/inaccessible'''
+
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf,
+           'experimental_features': ['keyspace-storage-options'],
+           'task_ttl_in_seconds': 300
+           }
+    cmd = ['--logger-log-level', 'snapshots=trace:task_manager=trace']
+    server = await manager.server_add(config=cfg, cmdline=cmd)
+    ks, cf = await prepare_snapshot_for_backup(manager, server)
+
+    workdir = await manager.server_get_workdir(server.server_id)
+    cf_dir = os.listdir(f'{workdir}/data/{ks}')[0]
+    files = set(os.listdir(f'{workdir}/data/{ks}/{cf_dir}/snapshots/backup'))
+    assert len(files) > 0
+
+    prefix = f'{cf}/backup'
+    tid = await manager.api.backup(server.ip_addr, ks, cf, 'backup', "does_not_exist", s3_server.bucket_name, prefix)
+    status = await manager.api.wait_task(server.ip_addr, tid)
+    assert status is not None
+    assert status['state'] == 'failed'
+    assert status['error'] == 'std::invalid_argument (endpoint does_not_exist not found)'
 
 async def do_test_backup_abort(manager: ManagerClient, s3_server,
                                breakpoint_name, min_files, max_files = None):
     '''helper for backup abort testing'''
 
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
@@ -182,6 +213,7 @@ async def do_test_backup_abort(manager: ManagerClient, s3_server,
     status = await manager.api.wait_task(server.ip_addr, tid)
     print(f'Status: {status}')
     assert (status is not None) and (status['state'] == 'failed')
+    assert "seastar::abort_requested_exception (abort requested)" in status['error']
 
     objects = set(o.key for o in get_s3_resource(s3_server).Bucket(s3_server.bucket_name).objects.all())
     uploaded_count = 0
@@ -201,8 +233,9 @@ async def do_test_backup_abort(manager: ManagerClient, s3_server,
 async def test_backup_to_non_existent_snapshot(manager: ManagerClient, s3_server):
     '''backup should fail if the snapshot does not exist'''
 
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
@@ -245,8 +278,9 @@ async def test_backup_is_abortable_in_s3_client(manager: ManagerClient, s3_serve
 async def do_test_simple_backup_and_restore(manager: ManagerClient, s3_server, do_abort = False):
     '''check that restoring from backed up snapshot for a keyspace:table works'''
 
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
@@ -379,7 +413,8 @@ async def test_restore_with_streaming_scopes(manager: ManagerClient, s3_server, 
     '''Check that restoring of a cluster with stream scopes works'''
 
     logger.info(f'Start cluster with {topology.nodes} nodes in {topology.dcs} DCs, {topology.racks} racks')
-    cfg = { 'object_storage_config_file': str(s3_server.config_file), 'task_ttl_in_seconds': 300 }
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
+    cfg = { 'object_storage_endpoints': objconf, 'task_ttl_in_seconds': 300 }
     cmd = [ '--logger-log-level', 'sstables_loader=debug:sstable_directory=trace:snapshots=trace:s3=trace:sstable=debug:http=debug' ]
     servers = []
     host_ids = {}
@@ -406,23 +441,25 @@ async def test_restore_with_streaming_scopes(manager: ManagerClient, s3_server, 
     for k in keys:
         cql.execute(f"INSERT INTO {ks}.{cf} ( pk, value ) VALUES ({k}, '{k}');")
 
-    logger.info(f'Collect sstables lists')
+    snap_name = unique_name('backup_')
+
+    logger.info(f'Take snapshot and collect sstables lists')
     sstables = []
     for s in servers:
         await manager.api.flush_keyspace(s.ip_addr, ks)
+        await manager.api.take_snapshot(s.ip_addr, ks, snap_name)
         workdir = await manager.server_get_workdir(s.server_id)
         cf_dir = os.listdir(f'{workdir}/data/{ks}')[0]
-        tocs = [ f.name for f in os.scandir(f'{workdir}/data/{ks}/{cf_dir}') if f.is_file() and f.name.endswith('TOC.txt') ]
-        logger.info(f'Collected sstables from {s.ip_addr}:{cf_dir}: {tocs}')
+        tocs = [ f.name for f in os.scandir(f'{workdir}/data/{ks}/{cf_dir}/snapshots/{snap_name}') if f.is_file() and f.name.endswith('TOC.txt') ]
+        logger.info(f'Collected sstables from {s.ip_addr}:{cf_dir}/snapshots/{snap_name}: {tocs}')
         sstables += tocs
 
-    snap_name = unique_name('backup_')
     logger.info(f'Backup to {snap_name}')
     prefix = f'{cf}/{snap_name}'
     async def do_backup(s):
-        await manager.api.take_snapshot(s.ip_addr, ks, snap_name)
         tid = await manager.api.backup(s.ip_addr, ks, cf, snap_name, s3_server.address, s3_server.bucket_name, prefix)
-        await manager.api.wait_task(s.ip_addr, tid)
+        status = await manager.api.wait_task(s.ip_addr, tid)
+        assert (status is not None) and (status['state'] == 'done')
 
     await asyncio.gather(*(do_backup(s) for s in servers))
 
@@ -435,7 +472,8 @@ async def test_restore_with_streaming_scopes(manager: ManagerClient, s3_server, 
     async def do_restore(s, toc_names, scope):
         logger.info(f'Restore {s.ip_addr} with {toc_names}, scope={scope}')
         tid = await manager.api.restore(s.ip_addr, ks, cf, s3_server.address, s3_server.bucket_name, prefix, toc_names, scope)
-        await manager.api.wait_task(s.ip_addr, tid)
+        status = await manager.api.wait_task(s.ip_addr, tid)
+        assert (status is not None) and (status['state'] == 'done')
 
     if topology.dcs > 1:
         scope = 'dc'
@@ -492,3 +530,28 @@ async def test_restore_with_streaming_scopes(manager: ManagerClient, s3_server, 
             scope_nodes.update([ str(host_ids[s.server_id]) for s in servers[i::topology.dcs] ])
         logger.info(f'{s.ip_addr} streamed to {streamed_to}, expected {scope_nodes}')
         assert streamed_to == scope_nodes
+
+
+@pytest.mark.asyncio
+async def test_restore_with_non_existing_sstable(manager: ManagerClient, s3_server):
+    '''Check that restore task fails well when given a non-existing sstable'''
+
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf,
+           'experimental_features': ['keyspace-storage-options'],
+           'task_ttl_in_seconds': 300
+           }
+    cmd = ['--logger-log-level', 'snapshots=trace:task_manager=trace']
+    server = await manager.server_add(config=cfg, cmdline=cmd)
+    cql = manager.get_cql()
+    print('Create keyspace')
+    ks, cf = create_ks_and_cf(cql)
+
+    # The name must be parseable by sstable layer, yet such file shouldn't exist
+    sstable_name = 'me-3gou_0fvw_4r94g2h8nw60b8ly4c-big-TOC.txt'
+    tid = await manager.api.restore(server.ip_addr, ks, cf, s3_server.address, s3_server.bucket_name, 'no_such_prefix', [sstable_name])
+    status = await manager.api.wait_task(server.ip_addr, tid)
+    print(f'Status: {status}')
+    assert 'state' in status and status['state'] == 'failed'
+    assert 'error' in status and 'Not Found' in status['error']

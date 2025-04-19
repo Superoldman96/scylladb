@@ -5,6 +5,7 @@
 #
 from cassandra.protocol import ConfigurationException, InvalidRequest, SyntaxException
 from cassandra.query import SimpleStatement, ConsistencyLevel
+from test.cluster.test_tablets2 import safe_rolling_restart
 from test.pylib.internal_types import ServerInfo
 from test.pylib.manager_client import ManagerClient
 from test.pylib.repair import create_table_insert_data_for_repair
@@ -13,7 +14,7 @@ from test.pylib.scylla_cluster import ReplaceConfig
 from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas
 from test.pylib.util import unique_name
 from test.cluster.conftest import skip_mode
-from test.cluster.util import wait_for_cql_and_get_hosts, create_new_test_keyspace, new_test_keyspace, reconnect_driver
+from test.cluster.util import wait_for_cql_and_get_hosts, create_new_test_keyspace, new_test_keyspace, reconnect_driver, get_topology_coordinator
 from contextlib import nullcontext as does_not_raise
 import time
 import pytest
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 @pytest.mark.asyncio
 async def test_tablet_replication_factor_enough_nodes(manager: ManagerClient):
-    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cfg = {'enable_user_defined_functions': False, 'tablets_mode_for_new_keyspaces': 'enabled'}
     servers = await manager.servers_add(2, config=cfg)
 
     cql = manager.get_cql()
@@ -42,14 +43,14 @@ async def test_tablet_replication_factor_enough_nodes(manager: ManagerClient):
         with pytest.raises(ConfigurationException, match=f"Datacenter {this_dc} doesn't have enough token-owning nodes"):
             await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
 
-            await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', '{this_dc}': 2}}")
-            await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+        await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', '{this_dc}': 2}}")
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
 
 
 @pytest.mark.asyncio
 async def test_tablet_scaling_option_is_respected(manager: ManagerClient):
     # 32 is high enough to ensure we demand more tablets than the default choice.
-    cfg = {'enable_tablets': True, 'tablets_initial_scale_factor': 32}
+    cfg = {'tablets_mode_for_new_keyspaces': 'enabled', 'tablets_initial_scale_factor': 32}
     servers = await manager.servers_add(1, config=cfg, cmdline=['--smp', '2'])
 
     cql = manager.get_cql()
@@ -64,7 +65,7 @@ async def test_tablet_scaling_option_is_respected(manager: ManagerClient):
 @pytest.mark.asyncio
 async def test_tablet_cannot_decommision_below_replication_factor(manager: ManagerClient):
     logger.info("Bootstrapping cluster")
-    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cfg = {'enable_user_defined_functions': False, 'tablets_mode_for_new_keyspaces': 'enabled'}
     servers = await manager.servers_add(4, config=cfg)
 
     logger.info("Creating table")
@@ -93,7 +94,7 @@ async def test_tablet_cannot_decommision_below_replication_factor(manager: Manag
 
 async def test_reshape_with_tablets(manager: ManagerClient):
     logger.info("Bootstrapping cluster")
-    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cfg = {'enable_user_defined_functions': False, 'tablets_mode_for_new_keyspaces': 'enabled'}
     server = (await manager.servers_add(1, config=cfg, cmdline=['--smp', '1']))[0]
 
     logger.info("Creating table")
@@ -130,7 +131,7 @@ async def test_reshape_with_tablets(manager: ManagerClient):
 @pytest.mark.parametrize("direction", ["up", "down", "none"])
 @pytest.mark.asyncio
 async def test_tablet_rf_change(manager: ManagerClient, direction):
-    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cfg = {'enable_user_defined_functions': False, 'tablets_mode_for_new_keyspaces': 'enabled'}
     servers = await manager.servers_add(3, config=cfg)
     for s in servers:
         await manager.api.disable_tablet_balancing(s.ip_addr)
@@ -197,7 +198,7 @@ async def test_tablet_mutation_fragments_unowned_partition(manager: ManagerClien
     """Check that MUTATION_FRAGMENTS() queries handle the case when a partition
     not owned by the node is attempted to be read."""
     cfg = {'enable_user_defined_functions': False,
-           'enable_tablets': True }
+           'tablets_mode_for_new_keyspaces': 'enabled' }
     servers = await manager.servers_add(3, config=cfg)
 
     cql = manager.get_cql()
@@ -215,14 +216,43 @@ async def test_tablet_mutation_fragments_unowned_partition(manager: ManagerClien
                 await cql.run_async(f"SELECT partition_region FROM MUTATION_FRAGMENTS({ks}.test) WHERE pk={k}", host=host[0])
 
 
+# ALTER KEYSPACE cannot change the replication factor by more than 1 at a time.
+# That provides us with a guarantee that the old and the new QUORUM overlap.
+# In this test, we verify that in a simple scenario with one DC. We explicitly disable
+# enforcing RF-rack-valid keyspaces to be able to perform more flexible alterations.
+@pytest.mark.asyncio
+async def test_singledc_alter_tablets_rf(manager: ManagerClient):
+    await manager.server_add(config={"rf_rack_valid_keyspaces": "false", "enable_tablets": "true"}, property_file={"dc": "dc1", "rack": "r1"})
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 1}") as ks:
+        async def change_rf(rf):
+            await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': {rf}}}")
+
+        await change_rf(2) # Increasing the RF by 1 should be OK.
+        await change_rf(3) # Increasing the RF by 1 again should also be OK.
+        await change_rf(3) # Setting the same RF shouldn't cause any problems.
+        await change_rf(4) # Increasing the RF by 1 again should still be OK.
+        await change_rf(3) # Decreasing the RF by 1 should be OK.
+
+        with pytest.raises(InvalidRequest):
+            await change_rf(5) # Trying to increase the RF by 2 should fail.
+        with pytest.raises(InvalidRequest):
+            await change_rf(1) # Trying to decrease the RF by 2 should fail.
+        with pytest.raises(InvalidRequest):
+            await change_rf(10) # Trying to increase the RF by more than 2 should fail.
+        with pytest.raises(InvalidRequest):
+            await change_rf(0) # Trying to decrease the RF by more than 2 should fail.
+
+
 # ALTER tablets KS cannot change RF of any DC by more than 1 at a time.
 # In a multi-dc environment, we can create replicas in a DC that didn't have replicas before,
 # but the above requirement should still be honoured, because we'd be changing RF from 0 to N in the new DC.
 # Reproduces https://github.com/scylladb/scylladb/issues/20039#issuecomment-2271365060
-# See also cqlpy/test_tablets.py::test_alter_tablet_keyspace_rf for basic scenarios tested
+# See also `test_singledc_alter_tablets_rf` above for basic scenarios tested
 @pytest.mark.asyncio
 async def test_multidc_alter_tablets_rf(request: pytest.FixtureRequest, manager: ManagerClient) -> None:
-    config = {"endpoint_snitch": "GossipingPropertyFileSnitch", "enable_tablets": "true"}
+    config = {"endpoint_snitch": "GossipingPropertyFileSnitch", "tablets_mode_for_new_keyspaces": "enabled"}
 
     logger.info("Creating a new cluster of 2 nodes in 1st DC and 2 nodes in 2nd DC")
     # we have to have at least 2 nodes in each DC if we want to try setting RF to 2 in each DC
@@ -268,7 +298,7 @@ async def test_multidc_alter_tablets_rf(request: pytest.FixtureRequest, manager:
 # from is migrated away.
 @pytest.mark.asyncio
 async def test_saved_readers_tablet_migration(manager: ManagerClient, build_mode):
-    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cfg = {'enable_user_defined_functions': False, 'tablets_mode_for_new_keyspaces': 'enabled'}
 
     if build_mode != "release":
         cfg['error_injections_at_startup'] = [{'name': 'querier-cache-ttl-seconds', 'value': 999999999}]
@@ -340,7 +370,7 @@ async def test_saved_readers_tablet_migration(manager: ManagerClient, build_mode
 @skip_mode('release', 'error injections are not supported in release mode')
 async def test_read_of_pending_replica_during_migration(manager: ManagerClient, with_cache):
     logger.info("Bootstrapping cluster")
-    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cfg = {'enable_user_defined_functions': False, 'tablets_mode_for_new_keyspaces': 'enabled'}
     cmdline = [
         '--logger-log-level', 'storage_service=debug',
         '--logger-log-level', 'raft_topology=debug',
@@ -400,6 +430,108 @@ async def test_read_of_pending_replica_during_migration(manager: ManagerClient, 
         assert len(list(rows)) == 1
 
 
+# Reproducer for https://github.com/scylladb/scylladb/issues/20073
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_explicit_tablet_movement_during_decommission(manager: ManagerClient):
+    logger.info("Bootstrapping cluster")
+    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cmdline = [
+        '--logger-log-level', 'storage_service=debug',
+        '--logger-log-level', 'raft_topology=debug',
+    ]
+
+    # Launch the cluster with two nodes.
+    server_tasks = [asyncio.create_task(manager.server_add(cmdline=cmdline, config=cfg)) for _ in range(2)]
+    servers = [await task for task in server_tasks]
+
+    # Disable the load balancer so that it does not move tablets behind our back mid-test. This does not disable automatic tablet movement in response to
+    # decommission, but we'll block the latter by injecting a wait-for-message.
+    #
+    # Load balancing being enabled or disabled is a cluster-global property; we can use any node to toggle it.
+    logger.info("Disabling load balancing")
+    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+
+    logger.info("Populating tablet")
+    # Create a table with just one partition and RF=1, so we have exactly one tablet.
+    cql = manager.get_cql()
+    await cql.run_async("CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1};")
+    await cql.run_async("CREATE TABLE test.tabmv_decomm (pk int PRIMARY KEY);")
+    await cql.run_async("INSERT INTO test.tabmv_decomm (pk) VALUES (0)")
+    rows = await cql.run_async("SELECT pk FROM test.tabmv_decomm")
+    assert len(list(rows)) == 1
+
+    logger.info("Identifying source, destination, coordinator and non-coordinator nodes")
+    # Get the sole replica (see RF=1 above) for the sole tablet. (The token value is irrelevant due to there being only one tablet.) We can ask either one of
+    # the nodes.
+    token = 0
+    source_task = asyncio.create_task(get_tablet_replica(manager, servers[0], 'test', 'tabmv_decomm', token))
+
+    # Get the IDs of both nodes.
+    node_id_tasks = [asyncio.create_task(manager.get_host_id(srv.server_id)) for srv in servers]
+
+    # Get the ID of the topology coordinator.
+    crd_task = asyncio.create_task(get_topology_coordinator(manager))
+
+    # Open the logs of both servers.
+    log_tasks = [asyncio.create_task(manager.server_open_log(srv.server_id)) for srv in servers]
+
+    # Collect results (completion order doesn't matter).
+    src_node_id, src_shard = await source_task
+    node_ids = [await task for task in node_id_tasks]
+    crd_id = await crd_task
+    logs = [await task for task in log_tasks]
+
+    # The destination node is the node that is not the source node. We always use shard#0 on the destination.
+    src = node_ids.index(src_node_id)
+    dst = 1 - src
+    dst_shard = 0
+
+    # The coordinator node is one of the two nodes. The non-coordinator node is the other node.
+    crd = node_ids.index(crd_id)
+    ncr = 1 - crd
+
+    # Four variations are possible:
+    #
+    # source  destination  coordinator  non-coordinator
+    # ------  -----------  -----------  ---------------
+    # node#0       node#1       node#0           node#1
+    # node#0       node#1       node#1           node#0
+    # node#1       node#0       node#0           node#1
+    # node#1       node#0       node#1           node#0
+    logger.info(f"src id={servers[src].server_id} ip={servers[src].ip_addr} node={node_ids[src]} shard={src_shard}")
+    logger.info(f"dst id={servers[dst].server_id} ip={servers[dst].ip_addr} node={node_ids[dst]} shard={dst_shard}")
+    logger.info(f"crd id={servers[crd].server_id} ip={servers[crd].ip_addr} node={node_ids[crd]}")
+    logger.info(f"ncr id={servers[ncr].server_id} ip={servers[ncr].ip_addr} node={node_ids[ncr]}")
+
+    logger.info("Decommissioning src")
+    # Inject a wait-for-message into the topology coordinator. We're going to block decommission right after entering the "tablet draining" transition state.
+    await manager.api.enable_injection(servers[crd].ip_addr, "suspend_decommission", one_shot=True)
+
+    # Initiate decommissioning the source node, and wait until the coordinator reaches "tablet draining".
+    crd_log_mark = await logs[crd].mark()
+    decomm_task = asyncio.create_task(manager.decommission_node(servers[src].server_id))
+    await logs[crd].wait_for('entered `tablet draining` transition state', from_mark=crd_log_mark)
+
+    logger.info("Moving tablet from src to dst")
+    # Move the tablet from the source node to the destination node. Ask the non-coordinator node to do it, as the coordinator node is suspended. Wait until the
+    # storage service on the non-coordinator node confirms it has seen the topology state machine as busy, and that it has kept the transition state intact.
+    ncr_log_mark = await logs[ncr].mark()
+    move_task = asyncio.create_task(manager.api.move_tablet(servers[ncr].ip_addr, "test", "tabmv_decomm",
+                                                            node_ids[src], src_shard, node_ids[dst], dst_shard, token))
+    await logs[ncr].wait_for(r'transit_tablet\([^)]+\): topology busy, keeping transition state', from_mark=ncr_log_mark)
+
+    logger.info("Completing decommissioning and tablet movement")
+    # Resume decommissioning.
+    await manager.api.message_injection(servers[crd].ip_addr, "suspend_decommission")
+
+    # Complete both the decommissioning and the explicit tablet movement (completion order does not matter).
+    #
+    # Completion of "decomm_task" shows that the decommission flow doesn't get stuck.
+    await decomm_task
+    await move_task
+
+
 # This test checks that --enable-tablets option and the TABLETS parameters of the CQL CREATE KEYSPACE
 # statemement are mutually correct from the "the least surprising behavior" concept. See comments inside
 # the test code for more details.
@@ -407,7 +539,7 @@ async def test_read_of_pending_replica_during_migration(manager: ManagerClient, 
 @pytest.mark.parametrize("replication_strategy", ["NetworkTopologyStrategy", "SimpleStrategy", "EverywhereStrategy", "LocalStrategy"])
 @pytest.mark.asyncio
 async def test_keyspace_creation_cql_vs_config_sanity(manager: ManagerClient, with_tablets, replication_strategy):
-    cfg = {'enable_tablets': with_tablets}
+    cfg = {'tablets_mode_for_new_keyspaces': 'enabled' if with_tablets else 'disabled'}
     server = await manager.server_add(config=cfg)
     cql = manager.get_cql()
 
@@ -444,13 +576,13 @@ async def test_keyspace_creation_cql_vs_config_sanity(manager: ManagerClient, wi
 
 @pytest.mark.asyncio
 async def test_tablets_and_gossip_topology_changes_are_incompatible(manager: ManagerClient):
-    cfg = {"enable_tablets": True, "force_gossip_topology_changes": True}
+    cfg = {"tablets_mode_for_new_keyspaces": "enabled", "force_gossip_topology_changes": True}
     with pytest.raises(Exception, match="Failed to add server"):
         await manager.server_add(config=cfg)
 
 @pytest.mark.asyncio
 async def test_tablets_disabled_with_gossip_topology_changes(manager: ManagerClient):
-    cfg = {"enable_tablets": False, "force_gossip_topology_changes": True}
+    cfg = {"tablets_mode_for_new_keyspaces": "disabled", "force_gossip_topology_changes": True}
     await manager.server_add(config=cfg)
     cql = manager.get_cql()
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as ks_name:
@@ -475,7 +607,7 @@ async def test_tablet_streaming_with_unbuilt_view(manager: ManagerClient):
         4) Once migration completes, the view should have the correct number of rows
     """
     logger.info("Starting Node 1")
-    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cfg = {'enable_user_defined_functions': False, 'tablets_mode_for_new_keyspaces': 'enabled'}
     cmdline = [
         '--logger-log-level', 'storage_service=debug',
         '--logger-log-level', 'raft_topology=debug',
@@ -531,7 +663,7 @@ async def test_tablet_streaming_with_staged_sstables(manager: ManagerClient):
         6) Once migration completes, the view should have the correct number of rows
     """
     logger.info("Starting Node 1")
-    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cfg = {'enable_user_defined_functions': False, 'tablets_mode_for_new_keyspaces': 'enabled'}
     cmdline = [
         '--logger-log-level', 'storage_service=debug',
         '--logger-log-level', 'raft_topology=debug',
@@ -604,7 +736,7 @@ async def test_orphaned_sstables_on_startup(manager: ManagerClient):
         7) Attempting to start node1 should fail as it now has an 'orphaned' sstable
     """
     logger.info("Starting Node 1")
-    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cfg = {'enable_user_defined_functions': False, 'tablets_mode_for_new_keyspaces': 'enabled'}
     cmdline = [
         '--logger-log-level', 'storage_service=debug',
         '--logger-log-level', 'raft_topology=debug',
@@ -854,3 +986,193 @@ async def test_two_tablets_concurrent_repair_and_migration(manager: ManagerClien
         [await manager.api.disable_injection(s.ip_addr, injection) for s in servers]
 
     await asyncio.gather(repair_task(), migration_task())
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_tablet_split_finalization_with_migrations(manager: ManagerClient):
+    """
+    Reproducer for https://github.com/scylladb/scylladb/issues/21762
+        1) Start a cluster with two nodes with error injected to prevent resize finalisatio
+        2) Create and populate `test` table
+        3) Trigger a split in the table by increasing `min_tablet_count`
+        4) Wait for the table `test` to reach split finalization stage
+        5) Create and populate another table `blocker`
+        6) Disable tablet balancing and move all tablets of `test` and `blocker` table from node 2 to node 1
+        7) Enable tablet balancing and disable error injection to allow migration and finalisation to proceed.
+        8) Expect finalization in `test` to be preferred over migrations in both tables
+    """
+    logger.info("Starting Cluster")
+    cfg = {
+        'enable_user_defined_functions': False, 'enable_tablets': True,
+        'error_injections_at_startup': [
+            'short_tablet_stats_refresh_interval',
+            # intially disable transitioning into tablet_resize_finalization topology state
+            'tablet_split_finalization_postpone',
+            ]
+        }
+    cmdline = [
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'load_balancer=debug',
+    ]
+    servers = await manager.servers_add(2, cmdline=cmdline, config=cfg)
+
+    logger.info("Create and populate test table")
+    cql = manager.get_cql()
+    await cql.run_async("CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 4};")
+    await cql.run_async("CREATE TABLE test.test (pk int PRIMARY KEY, c int);")
+    await manager.api.disable_autocompaction(servers[0].ip_addr, "test")
+    await asyncio.gather(*[cql.run_async(f"INSERT INTO test.test (pk, c) VALUES ({k}, {k%3});") for k in range(64)])
+    await manager.api.keyspace_flush(servers[0].ip_addr, "test", "test")
+    test_table_id = (await cql.run_async("SELECT id FROM system_schema.tables WHERE keyspace_name = 'test' AND table_name = 'test'"))[0].id
+
+    logger.info("Trigger split in table")
+    await cql.run_async("ALTER TABLE test.test WITH tablets = {'min_tablet_count': 8};")
+
+    # Wait for splits to finalise; they don't execute yet as they are prevented by the error injection
+    logger.info("Wait for tablets to split")
+    log = await manager.server_open_log(servers[0].server_id)
+    mark = await log.wait_for(f"Finalizing resize decision for table {test_table_id} as all replicas agree on sequence number 1")
+
+    logger.info("Create and populate `blocker` table")
+    await cql.run_async("CREATE TABLE test.blocker (pk int PRIMARY KEY, c int);")
+    await asyncio.gather(*[cql.run_async(f"INSERT INTO test.blocker (pk, c) VALUES ({k}, {k%3});") for k in range(128)])
+    await manager.api.keyspace_flush(servers[0].ip_addr, "test", "blocker")
+    blocker_table_id = (await cql.run_async("SELECT id FROM system_schema.tables WHERE keyspace_name = 'test' AND table_name = 'blocker'"))[0].id
+
+    s0_host_id = await manager.get_host_id(servers[0].server_id)
+    for cf in ["test", "blocker"]:
+        logger.info(f"Move all tablets of test.{cf} from Node 2 to Node 1")
+        await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+        s1_replicas = await get_all_tablet_replicas(manager, servers[1], "test", cf)
+        migration_tasks = [
+            manager.api.move_tablet(servers[0].ip_addr, "test", cf,
+                                    tablet.replicas[0][0], tablet.replicas[0][1],
+                                    s0_host_id, 0, tablet.last_token)
+            for tablet in s1_replicas
+        ]
+        await asyncio.gather(*migration_tasks)
+
+    logger.info("Re-enable tablet balancing; it should be blocked by pending split finalization")
+    await manager.api.enable_tablet_balancing(servers[0].ip_addr)
+    mark = await log.wait_for("Setting tablet balancing to true")
+
+    logger.info("Unblock resize finalisation and verify that the finalisation is preferred over migrations")
+    await manager.api.disable_injection(servers[0].ip_addr, "tablet_split_finalization_postpone")
+    split_finalization_mark = await log.wait_for("Finished tablet split finalization", mark)
+    for table_id in [test_table_id, blocker_table_id]:
+        migration_mark = await log.wait_for(f"Will set tablet {table_id}:\\d+ stage to write_both_read_old", mark)
+        assert split_finalization_mark < migration_mark, f"Tablet migration of {table_id} was scheduled before resize finalization"
+
+    # ensure all migrations complete
+    logger.info("Waiting for migrations to complete")
+    await log.wait_for("Tablet load balancer did not make any plan", migration_mark)
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_two_tablets_concurrent_repair_and_migration_repair_writer_level(manager: ManagerClient):
+    injection = "repair_writer_impl_create_writer_wait"
+    cmdline = [
+        '--logger-log-level', 'repair=debug',
+    ]
+    servers, cql, hosts, ks, table_id = await create_table_insert_data_for_repair(manager, cmdline=cmdline)
+    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+
+    async def insert_with_down(down_server):
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k + 1});") for k in range(10)])
+
+    cql = await safe_rolling_restart(manager, [servers[0]], with_down=insert_with_down)
+
+    all_replicas = await get_all_tablet_replicas(manager, servers[1], ks, "test")
+    all_replicas.sort(key=lambda x: x.last_token)
+    assert len(all_replicas) >= 3
+    repair_replicas = all_replicas[1]
+    migration_replicas = all_replicas[0]
+
+    logs = [await manager.server_open_log(s.server_id) for s in servers]
+    marks = [await log.mark() for log in logs]
+
+    async def repair_task():
+        [await manager.api.enable_injection(s.ip_addr, injection, one_shot=True) for s in servers]
+        await manager.api.tablet_repair(servers[0].ip_addr, ks, "test", repair_replicas.last_token)
+
+    async def migration_task():
+        done, pending = await asyncio.wait([asyncio.create_task(log.wait_for(f'repair_writer: keyspace={ks}', from_mark=mark)) for log, mark in zip(logs, marks)], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await manager.api.move_tablet(servers[0].ip_addr, ks, "test", migration_replicas.replicas[0][0], migration_replicas.replicas[0][1], migration_replicas.replicas[0][0], 0 if migration_replicas.replicas[0][1] != 0 else 1, migration_replicas.last_token)
+        [await manager.api.message_injection(s.ip_addr, injection) for s in servers]
+        [await manager.api.disable_injection(s.ip_addr, injection) for s in servers]
+
+    await asyncio.gather(repair_task(), migration_task())
+
+async def check_tablet_rebuild_with_repair(manager: ManagerClient, fail: bool):
+    logger.info("Bootstrapping cluster")
+    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    if fail:
+        cfg['error_injections_at_startup'] = ['rebuild_repair_stage_fail']
+    host_ids = []
+    servers = []
+
+    async def make_server():
+        s = await manager.server_add(config=cfg)
+        servers.append(s)
+        host_ids.append(await manager.get_host_id(s.server_id))
+        await manager.api.disable_tablet_balancing(s.ip_addr)
+
+    await make_server()
+    await make_server()
+    await make_server()
+
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+        keys = range(256)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
+
+        replicas = await get_all_tablet_replicas(manager, servers[0], ks, 'test')
+        logger.info(f"Tablet is on [{replicas}]")
+        assert len(replicas) == 1 and len(replicas[0].replicas) == 2
+        replicas = [ r[0] for r in replicas[0].replicas ]
+        for h in host_ids:
+            if h not in replicas:
+                new_replica = (h, 0)
+                break
+        else:
+            assert False, "Cannot find node without replica"
+
+        logs = []
+        for s in servers:
+            logs.append(await manager.server_open_log(s.server_id))
+
+        logger.info(f"Adding replica to tablet, host {new_replica[0]}")
+        await manager.api.add_tablet_replica(servers[0].ip_addr, ks, "test", new_replica[0], new_replica[1], 0)
+
+        assert sum([len(await log.grep(rf'.*Will set tablet .* stage to rebuild_repair.*')) for log in logs]) == 1
+
+        replicas = await get_all_tablet_replicas(manager, servers[0], ks, 'test')
+        logger.info(f"Tablet is now on [{replicas}]")
+        assert len(replicas) == 1
+        replicas = [ r[0] for r in replicas[0].replicas ]
+
+        assert len(replicas) == 2 if fail else len(replicas) == 3
+
+        for h, s in zip(host_ids, servers):
+            host = await wait_for_cql_and_get_hosts(cql, [s], time.time() + 30)
+            if h != host_ids[0]:
+                await read_barrier(manager.api, host[0].address)  # host-0 did the barrier in get_all_tablet_replicas above
+            res = await cql.run_async(f"SELECT COUNT(*) FROM MUTATION_FRAGMENTS({ks}.test)", host=host[0])
+            logger.info(f"Host {h} reports {res} as mutation fragments count")
+            if h in replicas:
+                assert res[0].count != 0
+            else:
+                assert res[0].count == 0
+
+@pytest.mark.asyncio
+async def test_tablet_rebuild(manager: ManagerClient):
+    await check_tablet_rebuild_with_repair(manager, False)
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_tablet_rebuild_failure(manager: ManagerClient):
+    await check_tablet_rebuild_with_repair(manager, True)

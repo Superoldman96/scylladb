@@ -69,8 +69,8 @@
 #include "test/lib/key_utils.hh"
 #include "test/lib/test_utils.hh"
 #include "test/lib/eventually.hh"
-#include "readers/from_mutations_v2.hh"
-#include "readers/from_fragments_v2.hh"
+#include "readers/from_mutations.hh"
+#include "readers/from_fragments.hh"
 #include "readers/combined.hh"
 #include "utils/assert.hh"
 #include "utils/pretty_printers.hh"
@@ -2274,7 +2274,7 @@ static std::deque<mutation_fragment_v2> explode(reader_permit permit, std::vecto
     auto schema = muts.front().schema();
     std::deque<mutation_fragment_v2> frags;
 
-    auto mr = make_mutation_reader_from_mutations_v2(schema, permit, std::move(muts));
+    auto mr = make_mutation_reader_from_mutations(schema, permit, std::move(muts));
     auto close_mr = deferred_close(mr);
     mr.consume_pausable([&frags] (mutation_fragment_v2&& mf) {
         frags.emplace_back(std::move(mf));
@@ -2783,9 +2783,9 @@ void scrub_validate_cassandra_compat(const compression_parameters& cp, sstring s
 SEASTAR_THREAD_TEST_CASE(sstable_scrub_validate_mode_test_valid_sstable_cassandra_compat) {
     for (const auto& [cp, subdir] : {
             std::pair{compression_parameters::no_compression(), "uncompressed"},
-            {compression_parameters(compressor::lz4), "lz4"}
+            {compression_parameters(compression_parameters::algorithm::lz4), "lz4"}
         }) {
-        testlog.info("Validating {}compressed SSTable from Cassandra...", cp.get_compressor() ? "" : "un");
+        testlog.info("Validating {}compressed SSTable from Cassandra...", cp.compression_enabled() ? "" : "un");
         scrub_validate_cassandra_compat(
                 cp,
                 seastar::format("test/resource/sstables/3.x/{}/partition_key_with_values_of_different_types", subdir),
@@ -2799,9 +2799,9 @@ SEASTAR_THREAD_TEST_CASE(sstable_scrub_validate_mode_test_valid_sstable_cassandr
 SEASTAR_THREAD_TEST_CASE(sstable_scrub_validate_mode_test_corrupted_file_cassandra_compat) {
     for (const auto& [cp, subdir] : {
             std::pair{compression_parameters::no_compression(), "uncompressed"},
-            {compression_parameters(compressor::lz4), "lz4"}
+            {compression_parameters(compression_parameters::algorithm::lz4), "lz4"}
         }) {
-        testlog.info("Validating {}compressed SSTable from Cassandra with invalid checksums...", cp.get_compressor() ? "" : "un");
+        testlog.info("Validating {}compressed SSTable from Cassandra with invalid checksums...", cp.compression_enabled() ? "" : "un");
         scrub_validate_cassandra_compat(
                 cp,
                 seastar::format("test/resource/sstables/3.x/{}/integrity_check/invalid_checksums", subdir),
@@ -2815,9 +2815,9 @@ SEASTAR_THREAD_TEST_CASE(sstable_scrub_validate_mode_test_corrupted_file_cassand
 SEASTAR_THREAD_TEST_CASE(sstable_scrub_validate_mode_test_corrupted_file_digest_cassandra_compat) {
     for (const auto& [cp, subdir] : {
             std::pair{compression_parameters::no_compression(), "uncompressed"},
-            {compression_parameters(compressor::lz4), "lz4"}
+            {compression_parameters(compression_parameters::algorithm::lz4), "lz4"}
         }) {
-        testlog.info("Validating {}compressed SSTable from Cassandra with invalid digest...", cp.get_compressor() ? "" : "un");
+        testlog.info("Validating {}compressed SSTable from Cassandra with invalid digest...", cp.compression_enabled() ? "" : "un");
         scrub_validate_cassandra_compat(
                 cp,
                 seastar::format("test/resource/sstables/3.x/{}/integrity_check/invalid_digest", subdir),
@@ -3652,7 +3652,7 @@ SEASTAR_TEST_CASE(partial_sstable_run_filtered_out_test) {
 
         sstable_writer_config sst_cfg = env.manager().configure_writer();
         sst_cfg.run_identifier = partial_sstable_run_identifier;
-        auto partial_sstable_run_sst = make_sstable_easy(env, make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), std::move(mut)), sst_cfg);
+        auto partial_sstable_run_sst = make_sstable_easy(env, make_mutation_reader_from_mutations(s, env.make_reader_permit(), std::move(mut)), sst_cfg);
 
         column_family_test(cf).add_sstable(partial_sstable_run_sst).get();
         column_family_test::update_sstables_known_generation(*cf, partial_sstable_run_sst->generation());

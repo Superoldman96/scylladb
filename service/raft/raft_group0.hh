@@ -13,6 +13,7 @@
 #include "service/raft/group0_fwd.hh"
 #include "gms/feature.hh"
 #include "utils/updateable_value.hh"
+#include <seastar/core/gate.hh>
 
 namespace cql3 { class query_processor; }
 
@@ -35,7 +36,7 @@ using can_vote = bool_class<can_vote_tag>;
 class persistent_discovery {
     discovery _discovery;
     cql3::query_processor& _qp;
-    seastar::gate _gate;
+    seastar::named_gate _gate;
 
 public:
     using peer_list = discovery::peer_list;
@@ -98,7 +99,7 @@ public:
 };
 
 class raft_group0 {
-    seastar::gate _shutdown_gate;
+    seastar::named_gate _shutdown_gate;
     seastar::abort_source& _abort_source;
     raft_group_registry& _raft_gr;
     sharded<netw::messaging_service>& _ms;

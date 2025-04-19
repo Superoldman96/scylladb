@@ -52,9 +52,11 @@ future<> ignore_reply(const http::reply& rep, input_stream<char>&& in_);
 
 class client : public enable_shared_from_this<client> {
     class multipart_upload;
+    class copy_s3_object;
     class upload_sink_base;
     class upload_sink;
     class upload_jumbo_sink;
+    class download_source;
     class do_upload_file;
     class readable_file;
     std::string _host;
@@ -114,11 +116,13 @@ public:
     future<temporary_buffer<char>> get_object_contiguous(sstring object_name, std::optional<range> range = {}, seastar::abort_source* = nullptr);
     future<> put_object(sstring object_name, temporary_buffer<char> buf, seastar::abort_source* = nullptr);
     future<> put_object(sstring object_name, ::memory_data_sink_buffers bufs, seastar::abort_source* = nullptr);
+    future<> copy_object(sstring source_object, sstring target_object, std::optional<size_t> part_size = {}, std::optional<tag> tag = {}, seastar::abort_source* = nullptr);
     future<> delete_object(sstring object_name, seastar::abort_source* = nullptr);
 
     file make_readable_file(sstring object_name, seastar::abort_source* = nullptr);
     data_sink make_upload_sink(sstring object_name, seastar::abort_source* = nullptr);
     data_sink make_upload_jumbo_sink(sstring object_name, std::optional<unsigned> max_parts_per_piece = {}, seastar::abort_source* = nullptr);
+    data_source make_download_source(sstring object_name, std::optional<range> range = {}, seastar::abort_source* = nullptr);
     /// upload a file with specified path to s3
     ///
     /// @param path the path to the file

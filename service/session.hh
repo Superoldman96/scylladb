@@ -10,7 +10,6 @@
 
 #include "utils/UUID.hh"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/semaphore.hh>
@@ -42,7 +41,7 @@ public:
     using link_type = bi::list_member_hook<bi::link_mode<bi::auto_unlink>>;
 private:
     session_id _id;
-    seastar::gate _gate;
+    seastar::named_gate _gate;
     std::optional<shared_future<>> _closed;
     link_type _link;
 public:
@@ -72,7 +71,7 @@ public:
         }
     };
 
-    explicit session(session_id id) : _id(id) {}
+    explicit session(session_id id) : _id(id), _gate("session") {}
 
     guard enter() {
         return guard(*this);

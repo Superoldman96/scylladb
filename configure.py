@@ -610,6 +610,10 @@ perf_tests = set([
     'test/perf/perf_sort_by_proximity',
 ])
 
+perf_standalone_tests = set([
+     'test/perf/perf_generic_server',
+])
+
 raft_tests = set([
     'test/raft/replication_test',
     'test/raft/randomized_nemesis_test',
@@ -644,7 +648,7 @@ lto_binaries = set([
     'scylla'
 ])
 
-tests = scylla_tests | perf_tests | raft_tests
+tests = scylla_tests | perf_tests | perf_standalone_tests | raft_tests
 
 other = set([
     'iotune',
@@ -680,8 +684,8 @@ arg_parser.add_argument('--compiler', action='store', dest='cxx', default='clang
                         help='C++ compiler path')
 arg_parser.add_argument('--c-compiler', action='store', dest='cc', default='clang',
                         help='C compiler path')
-add_tristate(arg_parser, name='dpdk', dest='dpdk',
-                        help='Use dpdk (from seastar dpdk sources) (default=True for release builds)')
+add_tristate(arg_parser, name='dpdk', dest='dpdk', default=False,
+                        help='Use dpdk (from seastar dpdk sources)')
 arg_parser.add_argument('--dpdk-target', action='store', dest='dpdk_target', default='',
                         help='Path to DPDK SDK target location (e.g. <DPDK SDK dir>/x86_64-native-linuxapp-gcc)')
 arg_parser.add_argument('--debuginfo', action='store', dest='debuginfo', type=int, default=1,
@@ -812,6 +816,7 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/rjson.cc',
                 'utils/human_readable.cc',
                 'utils/histogram_metrics_helper.cc',
+                'utils/io-wrappers.cc',
                 'utils/on_internal_error.cc',
                 'utils/pretty_printers.cc',
                 'utils/stream_compressor.cc',
@@ -825,7 +830,7 @@ scylla_core = (['message/messaging_service.cc',
                 'keys.cc',
                 'counters.cc',
                 'compress.cc',
-                'zstd.cc',
+                'sstable_dict_autotrainer.cc',
                 'sstables/sstables.cc',
                 'sstables/sstables_manager.cc',
                 'sstables/sstable_set.cc',
@@ -1163,6 +1168,7 @@ scylla_core = (['message/messaging_service.cc',
                 'ent/encryption/kms_key_provider.cc',
                 'ent/encryption/gcp_host.cc',
                 'ent/encryption/gcp_key_provider.cc',
+                'ent/encryption/utils.cc',
                 'ent/ldap/ldap_connection.cc',
                 'multishard_mutation_query.cc',
                 'reader_concurrency_semaphore.cc',
@@ -1185,6 +1191,7 @@ scylla_core = (['message/messaging_service.cc',
                 'service/raft/group0_state_id_handler.cc',
                 'service/raft/group0_state_machine.cc',
                 'service/raft/group0_state_machine_merger.cc',
+                'service/raft/group0_voter_handler.cc',
                 'service/raft/raft_sys_table_storage.cc',
                 'serializer.cc',
                 'release.cc',
@@ -1192,7 +1199,7 @@ scylla_core = (['message/messaging_service.cc',
                 'service/raft/raft_group_registry.cc',
                 'service/raft/discovery.cc',
                 'service/raft/raft_group0.cc',
-                'direct_failure_detector/failure_detector.cc',
+                'service/direct_failure_detector/failure_detector.cc',
                 'service/raft/raft_group0_client.cc',
                 'service/broadcast_tables/experimental/lang.cc',
                 'tasks/task_handler.cc',
@@ -1382,7 +1389,6 @@ scylla_perfs = ['test/perf/perf_alternator.cc',
                 'test/perf/perf_tablets.cc',
                 'test/perf/tablet_load_balancing.cc',
                 'test/perf/perf.cc',
-                'test/lib/alternator_test_env.cc',
                 'test/lib/cql_test_env.cc',
                 'test/lib/log.cc',
                 'test/lib/test_services.cc',
@@ -1473,13 +1479,16 @@ for t in sorted(scylla_tests):
     else:
         deps[t] += scylla_core + alternator + idls + scylla_tests_generic_dependencies
 
+for t in sorted(perf_tests | perf_standalone_tests):
+    deps[t] = [t + '.cc'] + scylla_tests_dependencies
+    deps[t] += ['test/perf/perf.cc', 'seastar/tests/perf/linux_perf_event.cc']
+
 perf_tests_seastar_deps = [
     'seastar/tests/perf/perf_tests.cc'
 ]
 
 for t in sorted(perf_tests):
-    deps[t] = [t + '.cc'] + scylla_tests_dependencies + perf_tests_seastar_deps
-    deps[t] += ['test/perf/perf.cc', 'seastar/tests/perf/linux_perf_event.cc']
+    deps[t] += perf_tests_seastar_deps
 
 deps['test/boost/combined_tests'] += [
     'test/boost/aggregate_fcts_test.cc',
@@ -1504,6 +1513,7 @@ deps['test/boost/combined_tests'] += [
     'test/boost/filtering_test.cc',
     'test/boost/group0_cmd_merge_test.cc',
     'test/boost/group0_test.cc',
+    'test/boost/group0_voter_calculator_test.cc',
     'test/boost/index_with_paging_test.cc',
     'test/boost/json_cql_query_test.cc',
     'test/boost/large_paging_state_test.cc',
@@ -1590,8 +1600,8 @@ deps['test/boost/rust_test'] += ['rust/inc/src/lib.rs']
 
 deps['test/raft/replication_test'] = ['test/raft/replication_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc', 'test/lib/eventually.cc'] + scylla_raft_dependencies
 deps['test/raft/raft_server_test'] = ['test/raft/raft_server_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc', 'test/lib/eventually.cc'] + scylla_raft_dependencies
-deps['test/raft/randomized_nemesis_test'] = ['test/raft/randomized_nemesis_test.cc', 'direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
-deps['test/raft/failure_detector_test'] = ['test/raft/failure_detector_test.cc', 'direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
+deps['test/raft/randomized_nemesis_test'] = ['test/raft/randomized_nemesis_test.cc', 'service/direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
+deps['test/raft/failure_detector_test'] = ['test/raft/failure_detector_test.cc', 'service/direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
 deps['test/raft/many_test'] = ['test/raft/many_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc', 'test/lib/eventually.cc'] + scylla_raft_dependencies
 deps['test/raft/fsm_test'] =  ['test/raft/fsm_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
 deps['test/raft/etcd_test'] =  ['test/raft/etcd_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
@@ -1731,19 +1741,11 @@ def generate_version(date_stamp):
 # the program headers.
 def dynamic_linker_option():
     gcc_linker_output = subprocess.check_output(['gcc', '-###', '/dev/null', '-o', 't'], stderr=subprocess.STDOUT).decode('utf-8')
-    original_dynamic_linker = re.search('-dynamic-linker ([^ ]*)', gcc_linker_output).groups()[0]
+    original_dynamic_linker = re.search('"?-dynamic-linker"?[ =]"?([^ "]*)"?[ \n]', gcc_linker_output).groups()[0]
 
-    employ_ld_trickery = True
-    # distro-specific setup
-    if os.environ.get('NIX_CC'):
-        employ_ld_trickery = False
-
-    if employ_ld_trickery:
-        # gdb has a SO_NAME_MAX_PATH_SIZE of 512, so limit the path size to
-        # that. The 512 includes the null at the end, hence the 511 below.
-        dynamic_linker = '/' * (511 - len(original_dynamic_linker)) + original_dynamic_linker
-    else:
-        dynamic_linker = original_dynamic_linker
+    # gdb has a SO_NAME_MAX_PATH_SIZE of 512, so limit the path size to
+    # that. The 512 includes the null at the end, hence the 511 below.
+    dynamic_linker = '/' * (511 - len(original_dynamic_linker)) + original_dynamic_linker
     return f'--dynamic-linker={dynamic_linker}'
 
 forced_ldflags = '-Wl,'
@@ -1879,9 +1881,8 @@ def prepare_advanced_optimizations(*, modes, build_modes, args):
                 submode['profile_target'] = profile_target
             submode['lib_cflags'] += f" -f{it}profile-generate={os.path.realpath(outdir)}/{submode_name} {conservative_opts}"
             submode['cxx_ld_flags'] += f" -f{it}profile-generate={os.path.realpath(outdir)}/{submode_name} {conservative_opts}"
-            # Profile collection depends on java tools because we use cassandra-stress as the load.
             submode['profile_recipe'] = textwrap.dedent(f"""\
-                build $builddir/{submode_name}/profiles/prof.profdata: train $builddir/{submode_name}/scylla | dist-tools-tar
+                build $builddir/{submode_name}/profiles/prof.profdata: train $builddir/{submode_name}/scylla
                 build $builddir/{submode_name}/profiles/merged.profdata: merge_profdata $builddir/{submode_name}/profiles/prof.profdata {profile_target or str()}
                 """)
             submode['is_profile'] = True
@@ -1965,8 +1966,6 @@ def configure_seastar(build_dir, mode, mode_config):
         seastar_cmake_args += ['-DSeastar_STACK_GUARDS={}'.format(stack_guards)]
 
     dpdk = args.dpdk
-    if dpdk is None:
-        dpdk = platform.machine() == 'x86_64' and mode == 'release'
     if dpdk:
         seastar_cmake_args += ['-DSeastar_DPDK=ON', '-DSeastar_DPDK_MACHINE=westmere']
     if args.split_dwarf:
@@ -2631,11 +2630,10 @@ def write_build_file(f,
         f.write(f'  mode = {mode}\n')
         f.write(f'build dist-server-{mode}: phony $builddir/dist/{mode}/redhat $builddir/dist/{mode}/debian\n')
         f.write(f'build dist-server-debuginfo-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-debuginfo-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
-        f.write(f'build dist-tools-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz dist-tools-rpm dist-tools-deb\n')
         f.write(f'build dist-cqlsh-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz dist-cqlsh-rpm dist-cqlsh-deb\n')
         f.write(f'build dist-python3-{mode}: phony dist-python3-tar dist-python3-rpm dist-python3-deb\n')
         f.write(f'build dist-unified-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
-        f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz: unified $builddir/{mode}/dist/tar/{scylla_product}-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz | always\n')
+        f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz: unified $builddir/{mode}/dist/tar/{scylla_product}-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz | always\n')
         f.write(f'  mode = {mode}\n')
         f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-package-{scylla_version}-{scylla_release}.tar.gz: copy $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
         f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{arch}-package-{scylla_version}-{scylla_release}.tar.gz: copy $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
@@ -2676,17 +2674,6 @@ def write_build_file(f,
         rule build-submodule-deb
           command = cd $dir && ./reloc/build_deb.sh --reloc-pkg $artifact
 
-        build tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz: build-submodule-reloc | $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE
-          reloc_dir = tools/java
-        build dist-tools-rpm: build-submodule-rpm tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-          dir = tools/java
-          artifact = build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build dist-tools-deb: build-submodule-deb tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-          dir = tools/java
-          artifact = build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build dist-tools-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz'.format(mode=mode, scylla_product=scylla_product, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
-        build dist-tools: phony dist-tools-tar dist-tools-rpm dist-tools-deb
-
         build tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz: build-submodule-reloc | $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE
           reloc_dir = tools/cqlsh
         build dist-cqlsh-rpm: build-submodule-rpm tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
@@ -2709,11 +2696,11 @@ def write_build_file(f,
           artifact = build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build dist-python3-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz'.format(mode=mode, scylla_product=scylla_product, arch=arch, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
         build dist-python3: phony dist-python3-tar dist-python3-rpm dist-python3-deb
-        build dist-deb: phony dist-server-deb dist-python3-deb dist-tools-deb dist-cqlsh-deb
-        build dist-rpm: phony dist-server-rpm dist-python3-rpm dist-tools-rpm dist-cqlsh-rpm
-        build dist-tar: phony dist-unified-tar dist-server-tar dist-python3-tar dist-tools-tar dist-cqlsh-tar
+        build dist-deb: phony dist-server-deb dist-python3-deb dist-cqlsh-deb
+        build dist-rpm: phony dist-server-rpm dist-python3-rpm dist-cqlsh-rpm
+        build dist-tar: phony dist-unified-tar dist-server-tar dist-python3-tar dist-cqlsh-tar
 
-        build dist: phony dist-unified dist-server dist-python3 dist-tools dist-cqlsh
+        build dist: phony dist-unified dist-server dist-python3 dist-cqlsh
         '''))
 
     f.write(textwrap.dedent(f'''\
@@ -2726,12 +2713,10 @@ def write_build_file(f,
         build $builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz: copy tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-python3-package.tar.gz: copy tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-python3-{arch}-package.tar.gz: copy tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
-        build $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz: copy tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build $builddir/{mode}/dist/tar/{scylla_product}-tools-package.tar.gz: copy tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz: copy tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-package.tar.gz: copy tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
 
-        build {mode}-dist: phony dist-server-{mode} dist-server-debuginfo-{mode} dist-python3-{mode} dist-tools-{mode} dist-unified-{mode} dist-cqlsh-{mode}
+        build {mode}-dist: phony dist-server-{mode} dist-server-debuginfo-{mode} dist-python3-{mode} dist-unified-{mode} dist-cqlsh-{mode}
         build dist-{mode}: phony {mode}-dist
         build dist-check-{mode}: dist-check
           mode = {mode}
