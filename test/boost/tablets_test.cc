@@ -9,6 +9,7 @@
 
 
 #include <seastar/core/shard_id.hh>
+#include <seastar/coroutine/as_future.hh>
 #undef SEASTAR_TESTING_MAIN
 #include <seastar/testing/test_case.hh>
 #include "test/lib/random_utils.hh"
@@ -82,10 +83,10 @@ void verify_tablet_metadata_update(cql_test_env& env, tablet_metadata& tm, std::
 }
 
 static
-cql_test_config tablet_cql_test_config(bool enable_tablets = true) {
+cql_test_config tablet_cql_test_config(db::tablets_mode_t::mode enable_tablets = db::tablets_mode_t::mode::enabled) {
     cql_test_config c;
-    c.db_config->enable_tablets(enable_tablets);
-    if (enable_tablets) {
+    c.db_config->tablets_mode_for_new_keyspaces(enable_tablets);
+    if (c.db_config->enable_tablets_by_default()) {
         c.initial_tablets = 2;
     }
     return c;
@@ -2633,41 +2634,25 @@ SEASTAR_THREAD_TEST_CASE(test_balancing_heterogeneous_cluster) {
         topology_builder topo(e);
         shared_load_stats& load_stats = topo.get_shared_load_stats();
 
-        std::vector<host_id> hosts;
-
-        uint64_t i4i_2xlarge_cap = 1'875'000'000'000;
-        uint64_t i4i_large_cap = 468'000'000'000;
-
-        auto add_i4i_2xlarge = [&] (endpoint_dc_rack rack) {
-            auto h = topo.add_node(node_state::normal, 7, rack);
-            load_stats.set_capacity(h, i4i_2xlarge_cap);
-            hosts.push_back(h);
-        };
-
-        auto add_i4i_large = [&] (endpoint_dc_rack rack) {
-            auto h = topo.add_node(node_state::normal, 2, rack);
-            load_stats.set_capacity(h, i4i_large_cap);
-            hosts.push_back(h);
-        };
-
         auto rack1 = topo.rack();
         auto rack2 = topo.start_new_rack();
         auto rack3 = topo.start_new_rack();
 
-        add_i4i_2xlarge(rack1);
-        add_i4i_2xlarge(rack2);
-        add_i4i_2xlarge(rack3);
+        topo.add_i4i_2xlarge(rack1);
+        topo.add_i4i_2xlarge(rack2);
+        topo.add_i4i_2xlarge(rack3);
 
         auto& stm = e.shared_token_metadata().local();
 
         auto ks_name = add_keyspace(e, {{topo.dc(), 3}});
         auto table1 = add_table(e, ks_name).get();
 
-        load_stats.set_size(table1, 0.9 * i4i_2xlarge_cap);
+        load_stats.set_size(table1, 0.9 * topo.get_capacity() / 3);
         rebalance_tablets(e, &load_stats);
         testlog.info("Initial cluster ready");
 
         std::unordered_map<host_id, double> initial_utilization;
+        auto& hosts = topo.hosts();
         {
             load_sketch load(stm.get());
             load.populate().get();
@@ -2678,7 +2663,7 @@ SEASTAR_THREAD_TEST_CASE(test_balancing_heterogeneous_cluster) {
             }
         }
 
-        add_i4i_large(rack1);
+        topo.add_i4i_large(rack1);
         rebalance_tablets(e, &load_stats);
         testlog.info("Expanded capacity in rack1");
 
@@ -2695,7 +2680,7 @@ SEASTAR_THREAD_TEST_CASE(test_balancing_heterogeneous_cluster) {
                              initial_utilization[hosts[2]]);
         }
 
-        add_i4i_large(rack2);
+        topo.add_i4i_large(rack2);
         rebalance_tablets(e, &load_stats);
         testlog.info("Expanded capacity in rack2");
 
@@ -2711,7 +2696,7 @@ SEASTAR_THREAD_TEST_CASE(test_balancing_heterogeneous_cluster) {
                              initial_utilization[hosts[2]]);
         }
 
-        add_i4i_large(rack3);
+        topo.add_i4i_large(rack3);
         rebalance_tablets(e, &load_stats);
         testlog.info("Expanded capacity in rack3");
 
@@ -2734,6 +2719,102 @@ SEASTAR_THREAD_TEST_CASE(test_balancing_heterogeneous_cluster) {
                 node_utilization.update(*u);
             }
             BOOST_REQUIRE_LT(node_utilization.max() - node_utilization.min(), 0.01);
+        }
+    }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_imbalance_in_hetero_cluster_with_two_tables) {
+    do_with_cql_env_thread([] (auto& e) {
+        topology_builder topo(e);
+        shared_load_stats& load_stats = topo.get_shared_load_stats();
+
+        auto rack1 = topo.rack();
+        auto rack2 = topo.start_new_rack();
+        auto rack3 = topo.start_new_rack();
+
+        topo.add_i4i_2xlarge(rack1);
+        topo.add_i4i_2xlarge(rack2);
+        topo.add_i4i_2xlarge(rack3);
+
+        auto& stm = e.shared_token_metadata().local();
+
+        auto ks_name = add_keyspace(e, {{topo.dc(), 3}}, 128);
+        auto table1 = add_table(e, ks_name).get();
+        load_stats.set_size(table1, 0);
+        testlog.info("Initial cluster ready");
+
+        topo.add_i4i_large(rack1);
+        topo.add_i4i_large(rack2);
+        topo.add_i4i_large(rack3);
+        rebalance_tablets(e, &load_stats);
+        testlog.info("Expanded capacity");
+
+        auto ks2_name = add_keyspace(e, {{topo.dc(), 3}}, 128);
+        auto table2 = add_table(e, ks2_name).get();
+
+        auto& hosts = topo.hosts();
+
+        {
+            load_sketch load(stm.get());
+            load.populate(std::nullopt, table2).get();
+
+            // Check that utilization difference is < 4%
+            min_max_tracker<double> node_utilization;
+            for (auto h: hosts) {
+                auto u = load.get_allocated_utilization(h, *topo.get_load_stats(), default_target_tablet_size);
+                BOOST_REQUIRE(u);
+                testlog.info("table2: {}: {}", h, u);
+                node_utilization.update(*u);
+            }
+            // Initial allocation is not capacity-aware so we're still not perfect here.
+            // See https://github.com/scylladb/scylladb/issues/23378
+            BOOST_REQUIRE_LT(node_utilization.max() - node_utilization.min(), 0.13);
+        }
+    }).get();
+}
+
+// Reproduces https://github.com/scylladb/scylladb/issues/23631
+SEASTAR_THREAD_TEST_CASE(test_imbalance_in_hetero_cluster_with_two_tables_imbalanced) {
+    do_with_cql_env_thread([] (auto& e) {
+        topology_builder topo(e);
+        shared_load_stats& load_stats = topo.get_shared_load_stats();
+
+        auto rack1 = topo.rack();
+        auto rack2 = topo.start_new_rack();
+        auto rack3 = topo.start_new_rack();
+
+        topo.add_i4i_2xlarge(rack1);
+        topo.add_i4i_2xlarge(rack2);
+        topo.add_i4i_2xlarge(rack3);
+
+        auto& stm = e.shared_token_metadata().local();
+
+        auto ks_name = add_keyspace(e, {{topo.dc(), 3}}, 512);
+        auto table1 = add_table(e, ks_name).get();
+        load_stats.set_size(table1, topo.get_capacity() * 0.8 / 3);
+        testlog.info("Initial cluster ready");
+
+        topo.add_i4i_large(rack1);
+        topo.add_i4i_large(rack2);
+        topo.add_i4i_large(rack3);
+        testlog.info("Expanded capacity");
+
+        auto ks2_name = add_keyspace(e, {{topo.dc(), 3}});
+        auto table2 = add_table(e, ks2_name).get();
+
+        auto& hosts = topo.hosts();
+
+        {
+            load_sketch load(stm.get());
+            load.populate(std::nullopt, table2).get();
+
+            min_max_tracker<double> node_utilization;
+            for (auto h : hosts) {
+                auto u = load.get_allocated_utilization(h, *topo.get_load_stats(), default_target_tablet_size);
+                testlog.info("table2: {}: {}", h, u);
+                node_utilization.update(u.value_or(0));
+            }
+            BOOST_REQUIRE_LT(node_utilization.max() - node_utilization.min(), 0.13);
         }
     }).get();
 }
@@ -3826,7 +3907,7 @@ SEASTAR_TEST_CASE(test_cleanup_of_deallocated_tablet) {
 
 namespace {
 
-future<> test_create_keyspace(sstring ks_name, std::optional<bool> tablets_opt, const cql_test_config& cfg, uint64_t initial_tablets = 0) {
+future<> test_create_keyspace(sstring ks_name, std::optional<bool> tablets_opt, const cql_test_config& cfg, uint64_t initial_tablets = 0, sstring replication_strategy = "NetworkTopologyStrategy") {
     co_await do_with_cql_env_thread([&] (cql_test_env& e) {
         sstring extra;
         if (tablets_opt) {
@@ -3840,7 +3921,7 @@ future<> test_create_keyspace(sstring ks_name, std::optional<bool> tablets_opt, 
                 extra = " and tablets = { 'enabled' : false }";
             }
         }
-        auto q = format("create keyspace {} with replication = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }}{};", ks_name, extra);
+        auto q = format("create keyspace {} with replication = {{ 'class' : '{}', 'replication_factor' : 1 }}{};", ks_name, replication_strategy, extra);
         testlog.debug("{}", q);
         e.execute_cql(q).get();
         BOOST_REQUIRE(e.local_db().has_keyspace(ks_name));
@@ -3851,7 +3932,7 @@ future<> test_create_keyspace(sstring ks_name, std::optional<bool> tablets_opt, 
             testlog.debug("shard table_count={}", count);
             return count;
         }, int64_t(0), std::plus<int64_t>()).get();
-        if (tablets_opt.value_or(cfg.db_config->enable_tablets())) {
+        if (tablets_opt.value_or(cfg.db_config->enable_tablets_by_default())) {
             if (initial_tablets) {
                 BOOST_REQUIRE_EQUAL(total, initial_tablets);
             } else {
@@ -3866,10 +3947,10 @@ future<> test_create_keyspace(sstring ks_name, std::optional<bool> tablets_opt, 
 }
 
 // Test that tablets can be explicitly enabled
-// when creating a keyspace when the `enable_tablets`
-// configuration option is set to `false`.
+// when creating a keyspace when the `tablets_mode_for_new_keyspaces`
+// configuration option is set to `disabled`.
 SEASTAR_TEST_CASE(test_explicit_tablets_enable) {
-    auto cfg = tablet_cql_test_config(false);
+    auto cfg = tablet_cql_test_config(db::tablets_mode_t::mode::disabled);
 
     // By default tablets are disabled
     co_await test_create_keyspace("test_default_settings", std::nullopt, cfg);
@@ -3880,13 +3961,21 @@ SEASTAR_TEST_CASE(test_explicit_tablets_enable) {
 
     // Tablets can also be explicitly disabled for a new keyspace
     co_await test_create_keyspace("test_explictly_disabled", false, cfg);
+
+    // Replication strategies that do not support tablets cannot be used when tablets are explicitly enabled
+    for (const auto& [rs_desc, rs_type] : db::replication_strategy_restriction_t::map()) {
+        if (rs_type != locator::replication_strategy_type::network_topology) {
+            auto f = co_await coroutine::as_future(test_create_keyspace("test_unsupported_replication_strategy", true, cfg, 0, rs_desc));
+            BOOST_REQUIRE_THROW(f.get(), exceptions::configuration_exception);
+        }
+    }
 }
 
 // Test that tablets can be explicitly disabled
-// when creating a keyspace when the `enable_tablets`
-// configuration option is set to `true`.
+// when creating a keyspace when the `tablets_mode_for_new_keyspaces`
+// configuration option is set to `enabled`.
 SEASTAR_TEST_CASE(test_explicit_tablets_disable) {
-    auto cfg = tablet_cql_test_config(true);
+    auto cfg = tablet_cql_test_config(db::tablets_mode_t::mode::enabled);
 
     // By default tablets are enabled
     co_await test_create_keyspace("test_default_settings", std::nullopt, cfg);
@@ -3897,6 +3986,28 @@ SEASTAR_TEST_CASE(test_explicit_tablets_disable) {
     // Tablets can also be explicitly enabled for a new keyspace
     co_await test_create_keyspace("test_explictly_enabled_0", true, cfg, 0);
     co_await test_create_keyspace("test_explictly_enabled_128", true, cfg, 128);
+}
+
+// Test that when tablets they cannot be explicitly disabled
+// when creating a keyspace when the `enable_tablets`
+// configuration option is set to `force`.
+SEASTAR_TEST_CASE(test_enforce_tablets) {
+    auto cfg = tablet_cql_test_config(db::tablets_mode_t::mode::enforced);
+
+    // By default tablets are enabled
+    co_await test_create_keyspace("test_default_settings", std::nullopt, cfg);
+
+    // Tablets cannot be explicitly disabled for a new keyspace
+    auto f = co_await coroutine::as_future(test_create_keyspace("test_not_explictly_disabled", false, cfg));
+    BOOST_REQUIRE_THROW(f.get(), exceptions::configuration_exception);
+
+    // Replication strategies that do not support tablets cannot be used when tablets are explicitly enabled
+    for (const auto& [rs_desc, rs_type] : db::replication_strategy_restriction_t::map()) {
+        if (rs_type != locator::replication_strategy_type::network_topology) {
+            auto f = co_await coroutine::as_future(test_create_keyspace("test_unsupported_replication_strategy", true, cfg, 0, rs_desc));
+            BOOST_REQUIRE_THROW(f.get(), exceptions::configuration_exception);
+        }
+    }
 }
 
 SEASTAR_TEST_CASE(test_recognition_of_deprecated_name_for_resize_transition) {

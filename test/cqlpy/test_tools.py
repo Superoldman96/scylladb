@@ -24,10 +24,13 @@ import shutil
 import uuid
 from . import nodetool
 from . import util
+import stat
 from typing import Iterable, Type, Union
 from cassandra.util import Duration
+import yaml
 
 from test.cluster.object_store.conftest import s3_server, get_s3_resource
+from test.pylib.minio_server import MinioServer
 
 
 def simple_no_clustering_table(cql, keyspace):
@@ -147,8 +150,16 @@ def table_with_counters(cql, keyspace):
 
 
 def get_sstables_for_table(data_dir, keyspace, table):
-    return glob.glob(os.path.join(data_dir, keyspace, table + '-*', '*-Data.db'))
+    def sstable_has_no_temporary_toc(sst):
+        path, basename = os.path.split(sst)
+        basename_components = basename.split("-")
 
+        toc_basename = "-".join(basename_components[:-1] + ["TOC.txt"])
+        temporary_toc_basename = "-".join(basename_components[:-1] + ["TOC.txt.tmp"])
+
+        return os.path.exists(os.path.join(path, toc_basename)) and not os.path.exists(os.path.join(path, temporary_toc_basename))
+
+    return list(filter(sstable_has_no_temporary_toc, glob.glob(os.path.join(data_dir, keyspace, table + '-*', '*-Data.db'))))
 
 @contextlib.contextmanager
 def scylla_sstable(table_factory, cql, ks, data_dir, s3_server=None, copy_to_s3=False, everywhere=False):
@@ -204,10 +215,10 @@ def upload_folder_to_s3(folder_path, s3_server):
 def test_scylla_sstable_dump_component_with_s3(skip_s3_tests, cql, test_keyspace, scylla_path, scylla_data_dir,
                                                scylla_home_dir, what,
                                                where, s3_server):
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
     scylla_yaml_file = os.path.join(scylla_home_dir, "conf", "scylla.yaml")
     with open(scylla_yaml_file, "a") as f:
-        f.write(f"\nobject_storage_config_file: {str(s3_server.config_file)}")
-
+        f.write(f"\n{yaml.dump({'object_storage_endpoints': objconf})}")
     with scylla_sstable(simple_clustering_table, cql, test_keyspace, scylla_data_dir, s3_server,
                         False if where == "local" else True, True if where == "mixed" else False) as (
     _, schema_file, sstables):
@@ -225,9 +236,10 @@ def test_scylla_sstable_dump_component_with_s3(skip_s3_tests, cql, test_keyspace
 def test_scylla_sstable_dump_data_with_s3(skip_s3_tests, cql, test_keyspace, scylla_path, scylla_data_dir,
                                           scylla_home_dir, where,
                                           s3_server):
+    objconf = MinioServer.create_conf(s3_server.address, s3_server.port, s3_server.region)
     scylla_yaml_file = os.path.join(scylla_home_dir, "conf", "scylla.yaml")
     with open(scylla_yaml_file, "a") as f:
-        f.write(f"\nobject_storage_config_file: {str(s3_server.config_file)}")
+        f.write(f"\n{yaml.dump({'object_storage_endpoints': objconf})}")
     with scylla_sstable(simple_clustering_table, cql, test_keyspace, scylla_data_dir, s3_server,
                         False if where == "local" else True, True if where == "mixed" else False) as (
     _, schema_file, sstables):
@@ -1160,13 +1172,6 @@ def test_scrub_output_dir(scylla_path, scrub_workdir, scrub_schema_file, scrub_g
         subprocess.check_call([scylla_path, "sstable", "scrub", "--schema-file", scrub_schema_file, "--scrub-mode", "abort", "--output-dir", tmp_dir, "--unsafe-accept-nonempty-output-dir", scrub_good_sstable])
 
 
-def test_scrub_output_dir_sstable_clash(scylla_path, scrub_workdir, scrub_schema_file, scrub_good_sstable):
-    with tempfile.TemporaryDirectory(prefix="test_scrub_output_dir_sstable_clash", dir=scrub_workdir) as tmp_dir:
-        subprocess.check_call([scylla_path, "sstable", "scrub", "--schema-file", scrub_schema_file, "--scrub-mode", "abort", "--output-dir", tmp_dir, "--unsafe-accept-nonempty-output-dir", scrub_good_sstable])
-        check_scrub_output_dir(tmp_dir, 1)
-        subprocess_check_error([scylla_path, "sstable", "scrub", "--schema-file", scrub_schema_file, "--scrub-mode", "abort", "--output-dir", tmp_dir, "--unsafe-accept-nonempty-output-dir", scrub_good_sstable], "cannot create output sstable .*, file already exists")
-
-
 def test_scrub_abort_mode(scylla_path, scrub_workdir, scrub_schema_file, scrub_good_sstable, scrub_bad_sstable):
     with tempfile.TemporaryDirectory(prefix="test_scrub_abort_mode", dir=scrub_workdir) as tmp_dir:
         subprocess.check_call([scylla_path, "sstable", "scrub", "--schema-file", scrub_schema_file, "--scrub-mode", "abort", "--output-dir", tmp_dir, scrub_good_sstable])
@@ -1369,6 +1374,27 @@ def test_scylla_sstable_format_version(cql, test_keyspace, scylla_data_dir):
             # new installation of scylla, this setting does not exist.
             assert sstable_version == "me", f"unexpected sstable format: {sstable_version}"
 
+def test_create_local_key_file(scylla_path):
+    with tempfile.TemporaryDirectory() as dir:
+        file = os.path.join(dir, "keyfile")
+        subprocess.check_call([scylla_path, "local-file-key-generator", "generate", file])
+        assert os.path.isfile(file)
+        status = os.stat(file)
+        assert (status.st_mode & 0xfff) == (stat.S_IRUSR | stat.S_IWUSR)
+        num_lines = sum(1 for _ in open(file))
+        assert num_lines > 0
+
+def test_create_local_key_file_with_args(scylla_path):
+    with tempfile.TemporaryDirectory() as dir:
+        file = os.path.join(dir, "keyfile")
+        subprocess.check_call([scylla_path, "local-file-key-generator", "generate", "-a", "DESEDE", "-l", "128", "-b", "ECB", file])
+        assert os.path.isfile(file)
+        status = os.stat(file)
+        assert (status.st_mode & 0xfff) == (stat.S_IRUSR | stat.S_IWUSR)
+        for line in open(file):
+            assert re.match(r"DESEDE/ECB/PKCS5Padding:128:\S+", line)
+            break
+
 
 class sstable_query_tester:
     def __init__(self, cql, scylla_path, sstables, keyspace, table, temp_workdir):
@@ -1390,6 +1416,7 @@ class sstable_query_tester:
             sstable_query_result = json.loads(subprocess.check_output([
                 self._scylla_path, "sstable", "query",
                 "--logger-log-level", "scylla-sstable=debug",
+                "--reactor-backend=linux-aio",
                 "--output-format", "json",
                 "--schema-tables",
                 "--query-file", query_file.name] + self._sstables))
@@ -1649,7 +1676,7 @@ def test_scylla_sstable_query_bad_command_line(cql, scylla_path, scylla_data_dir
     """Check that not-allowed command line param combinations are refused."""
     nodetool.flush_keyspace(cql, "system")
 
-    with nodetool.no_autocompaction_context(cql, "system"):
+    with nodetool.no_autocompaction_context(cql, "system.local"):
         sstables = get_sstables_for_table(scylla_data_dir, "system", "local")
 
         common_params = [scylla_path, "sstable", "query", "--system-schema", "--keyspace", "system", "--table", "local", "--query-file", "whatever.cql"]
@@ -1666,10 +1693,10 @@ def test_scylla_sstable_query_bad_command_line(cql, scylla_path, scylla_data_dir
 
 def test_scylla_sstable_query_validation(cql, scylla_path, scylla_data_dir):
     """Check that not-allowed command line param combinations are refused."""
-    with nodetool.no_autocompaction_context(cql, "system"):
+    with nodetool.no_autocompaction_context(cql, "system.local"):
         sstables = get_sstables_for_table(scylla_data_dir, "system", "local")
 
-        common_params = [scylla_path, "sstable", "query", "--system-schema", "--keyspace", "system", "--table", "local", "--query"]
+        common_params = [scylla_path, "sstable", "query", "--system-schema", "--keyspace", "system", "--table", "local", "--reactor-backend=linux-aio", "--query"]
 
         def check(bad_query, expected_error):
             res = subprocess.run(common_params + [bad_query] + sstables, text=True, capture_output=True)
@@ -1694,7 +1721,7 @@ def test_scylla_sstable_query_temp_dir(cql, scylla_path, scylla_data_dir):
     its temp-dir on exit. So we test with a negative test: give an impossible
     path and check that creating the temp-dir fails.
     """
-    with nodetool.no_autocompaction_context(cql, "system"):
+    with nodetool.no_autocompaction_context(cql, "system.local"):
         sstables = get_sstables_for_table(scylla_data_dir, "system", "local")
 
         with tempfile.NamedTemporaryFile("r") as f:

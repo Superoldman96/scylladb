@@ -31,7 +31,7 @@
 #include "gms/feature_service.hh"
 #include "reader_concurrency_semaphore.hh"
 #include "readers/combined.hh"
-#include "readers/generating_v2.hh"
+#include "readers/generating.hh"
 #include "schema/schema_builder.hh"
 #include "sstables/index_reader.hh"
 #include "sstables/sstables_manager.hh"
@@ -355,11 +355,11 @@ const std::vector<sstables::shared_sstable> load_sstables(schema_ptr schema, sst
         auto ed = sstables::parse_path(sst_path, schema->ks_name(), schema->cf_name());
 
         if (s3::is_s3_fqn(sst_path)) {
-            if (sst_man.config().object_storage_config().empty()) {
+            if (sst_man.config().object_storage_endpoints().empty()) {
                 throw std::invalid_argument("Unable to open SSTable in S3: AWS object storage configuration missing. Please provide a --scylla-yaml-file with "
                                             "valid AWS object storage configuration.");
             }
-            auto endpoint = sst_man.config().object_storage_config().begin()->first;
+            auto endpoint = sst_man.config().object_storage_endpoints().front().endpoint;
             options = data_dictionary::make_s3_options(endpoint, sst_path);
         } else {
             sst_path = std::filesystem::canonical(std::filesystem::path(sst_name));
@@ -923,7 +923,7 @@ private:
     sstables::shared_sstable do_make_sstable() const {
         const auto format = sstables::sstable_format_types::big;
         const auto version = sstables::get_highest_sstable_version();
-        auto generation = _generation_generator();
+        auto generation = _generation_generator(uuid_identifiers::yes);
         auto sst_name = sstables::sstable::filename(_output_dir, _schema->ks_name(), _schema->cf_name(), version, generation, format, component_type::Data);
         if (file_exists(sst_name).get()) {
             throw std::runtime_error(fmt::format("cannot create output sstable {}, file already exists", sst_name));
@@ -941,8 +941,8 @@ public:
         , _permit(std::move(permit))
         , _sst_man(sst_man)
         , _output_dir(std::move(output_dir))
-        , _main_set(sstables::make_partitioned_sstable_set(_schema, false))
-        , _maintenance_set(sstables::make_partitioned_sstable_set(_schema, false))
+        , _main_set(sstables::make_partitioned_sstable_set(_schema, token_range()))
+        , _maintenance_set(sstables::make_partitioned_sstable_set(_schema, token_range()))
         , _compaction_strategy(sstables::make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
         , _compaction_strategy_state(compaction::compaction_strategy_state::make(_compaction_strategy))
         , _tombstone_gc_state(nullptr)
@@ -950,6 +950,7 @@ public:
         , _group_id("dummy-group")
         , _generation_generator(0)
     { }
+    virtual dht::token_range token_range() const noexcept override { return dht::token_range::make(dht::first_token(), dht::last_token()); }
     virtual const schema_ptr& schema() const noexcept override { return _schema; }
     virtual unsigned min_compaction_threshold() const noexcept override { return _schema->min_compaction_threshold(); }
     virtual bool compaction_enforce_min_threshold() const noexcept override { return false; }
@@ -2637,7 +2638,7 @@ void write_operation(schema_ptr schema, reader_permit permit, const std::vector<
     auto ifile = open_file_dma(input_file, open_flags::ro).get();
     auto istream = make_file_input_stream(std::move(ifile));
     auto parser = json_mutation_stream_parser{schema, permit, std::move(istream)};
-    auto reader = make_generating_reader_v2(schema, permit, std::move(parser));
+    auto reader = make_generating_reader(schema, permit, std::move(parser));
     auto writer_cfg = manager.configure_writer("scylla-sstable");
     writer_cfg.validation_level = validation_level;
     auto local = data_dictionary::make_local_options(output_dir);
@@ -3521,8 +3522,6 @@ $ scylla sstable validate /path/to/md-123456-big-Data.db /path/to/md-123457-big-
             }).get();
             dbcfg.setup_directories();
             sst_log.debug("Successfully read scylla.yaml from {} location of {}", scylla_yaml_path_source, scylla_yaml_path);
-            read_object_storage_config(dbcfg).get();
-            sst_log.debug("Successfully read object storage settings");
         } else {
             dbcfg.experimental_features.set(db::experimental_features_t::all());
             sst_log.debug("Failed to read scylla.yaml from {} location of {}, some functionality may be unavailable", scylla_yaml_path_source, scylla_yaml_path);
@@ -3560,6 +3559,7 @@ $ scylla sstable validate /path/to/md-123456-big-Data.db /path/to/md-123457-big-
         }
 
         gms::feature_service feature_service(gms::feature_config_from_db_config(dbcfg));
+        auto scf = make_sstable_compressor_factory_for_tests_in_thread();
         cache_tracker tracker;
         sstables::directory_semaphore dir_sem(1);
         abort_source abort;
@@ -3579,6 +3579,7 @@ $ scylla sstable validate /path/to/md-123456-big-Data.db /path/to/md-123457-big-
             1_GiB,
             dir_sem,
             [host_id = locator::host_id::create_random_id()] { return host_id; },
+            *scf,
             abort,
             current_scheduling_group(),
             &sstm.local());

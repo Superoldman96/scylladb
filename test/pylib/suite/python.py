@@ -14,9 +14,10 @@ import xml.etree.ElementTree as ET
 from typing import TYPE_CHECKING
 
 from scripts import coverage
+from test import path_to
 from test.pylib.pool import Pool
 from test.pylib.scylla_cluster import ScyllaCluster, ScyllaServer, merge_cmdline_options
-from test.pylib.suite.base import Test, TestSuite, path_to, read_log, run_test
+from test.pylib.suite.base import Test, TestSuite, read_log, run_test
 from test.pylib.util import LogPrefixAdapter
 
 if TYPE_CHECKING:
@@ -85,7 +86,7 @@ class PythonTestSuite(TestSuite):
             server = ScyllaServer(
                 mode=self.mode,
                 exe=self.scylla_exe,
-                vardir=os.path.join(self.options.tmpdir, self.mode),
+                vardir=self.log_dir,
                 logger=create_cfg.logger,
                 cluster_name=create_cfg.cluster_name,
                 ip_addr=create_cfg.ip_addr,
@@ -144,7 +145,7 @@ class PythonTest(Test):
         self.path = "python"
         self.core_args = ["-m", "pytest"]
         self.casename = casename
-        self.xmlout = os.path.join(self.suite.options.tmpdir, self.mode, "xml", self.uname + ".xunit.xml")
+        self.xmlout = self.suite.log_dir / "xml" / f"{self.uname}.xunit.xml"
         self.server_log: Optional[str] = None
         self.server_log_filename: Optional[pathlib.Path] = None
         self.is_before_test_ok = False
@@ -162,8 +163,10 @@ class PythonTest(Test):
             "--junit-xml={}".format(self.xmlout),
             "-rs",
             "--run_id={}".format(self.id),
-            "--mode={}".format(self.mode)
+            "--mode={}".format(self.mode),
         ]
+        if options.gather_metrics:
+            self.args.append("--gather-metrics")
         self.args.append(f"--alluredir={self.allure_dir}")
         if not options.save_log_on_success:
             self.args.append("--allure-no-capture")
@@ -212,12 +215,14 @@ class PythonTest(Test):
                     cc.execute(stmt)
                 cluster.prepare_cql_executed = True
             logger.info("Leasing Scylla cluster %s for test %s", cluster, self.uname)
-            self.args.insert(0, "--host={}".format(cluster.endpoint()))
+            self.args.insert(0, f"--host={cluster.endpoint()}")
+            log_filename = next(server.log_filename for server in cluster.running.values())
+            self.args.insert(0, f"--scylla-log-filename={log_filename}")
             self.is_before_test_ok = True
             cluster.take_log_savepoint()
             status = await run_test(self, options, env=self.suite.scylla_env)
-            # if self.shortname in self.suite.dirties_cluster:
-            cluster.is_dirty = True
+            if self.shortname in self.suite.dirties_cluster:
+                cluster.is_dirty = True
             cluster.after_test(self.uname, status)
             self.is_after_test_ok = True
             self.success = status

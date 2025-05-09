@@ -294,6 +294,7 @@ future<> test_client_upload_file(const client_maker_function& client_maker, std:
 
     co_await readable_file.close();
     co_await input.close();
+    co_await client->delete_object(object_name);
     co_await client->close();
 }
 
@@ -584,6 +585,7 @@ SEASTAR_THREAD_TEST_CASE(test_object_reupload) {
     semaphore mem(16 << 20);
     auto cln = make_minio_client(mem);
     auto close_client = deferred_close(*cln);
+    auto delete_object = deferred_delete_object(cln, name);
     constexpr std::string_view content{"1234567890"};
     for (auto i : {1, 2}) {
         testlog.info("Put object {}, iteration {}", name, i);
@@ -624,6 +626,95 @@ SEASTAR_THREAD_TEST_CASE(test_object_reupload) {
             BOOST_REQUIRE_EQUAL(st.size, object_size);
         }
     }
+}
+
+void test_download_data_source(const client_maker_function& client_maker, unsigned chunks) {
+    const sstring name(fmt::format("/{}/testdatasourceobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
+
+    testlog.info("Make client\n");
+    semaphore mem(16<<20);
+    auto cln = client_maker(mem);
+    auto close_client = deferred_close(*cln);
+    auto delete_object = deferred_delete_object(cln, name);
+
+    static constexpr unsigned chunk_size = 1000;
+    testlog.info("Preparation: Upload object");
+    auto rnd = tests::random::get_bytes(chunk_size);
+    {
+        auto out = output_stream<char>(cln->make_upload_sink(name));
+        auto close = seastar::deferred_close(out);
+
+        for (unsigned ch = 0; ch < chunks; ch++) {
+            out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+        }
+        out.flush().get();
+    }
+
+    testlog.info("Download object");
+    auto in = input_stream<char>(cln->make_download_source(name, {}));
+    auto close = seastar::deferred_close(in);
+    for (unsigned ch = 0; ch < chunks; ch++) {
+        auto buf = in.read_exactly(chunk_size).get();
+        BOOST_REQUIRE_EQUAL(memcmp(buf.begin(), rnd.begin(), 1000), 0);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_download_data_source_minio) {
+    test_download_data_source(make_minio_client, 128 * 1024);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_download_data_source_proxy) {
+    test_download_data_source(make_proxy_client, 3 * 1024);
+}
+
+void test_object_copy(const client_maker_function& client_maker, size_t chunk_size, size_t chunks) {
+    const sstring name(fmt::format("/{}/testobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
+    const sstring name_copy(fmt::format("/{}/testobject-{}-copy", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
+
+    semaphore mem(16 << 20);
+    auto cln = client_maker(mem);;
+    auto close_client = deferred_close(*cln);
+    auto delete_object = deferred_delete_object(cln, name);
+    auto delete_copy_object = deferred_delete_object(cln, name_copy);
+
+    auto out = output_stream<char>(cln->make_upload_sink(name));
+    auto rnd = tests::random::get_bytes(chunk_size);
+
+    for (unsigned ch = 0; ch < chunks; ch++) {
+        out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+    }
+
+    out.flush().get();
+    out.close().get();
+    cln->copy_object(name, name_copy, 5_MiB).get();
+
+    auto sz = cln->get_object_size(name_copy).get();
+    BOOST_REQUIRE_EQUAL(sz, chunk_size * chunks);
+
+    for (size_t off = 0; off < sz; off += chunk_size) {
+        auto len = std::min(chunk_size, sz - off);
+        auto range = s3::range{off, len};
+        auto orig_buf = cln->get_object_contiguous(name, range).get();
+        auto copy_buf = cln->get_object_contiguous(name_copy, range).get();
+        testlog.info("Got [{}:{}) chunk", off, len);
+        BOOST_REQUIRE_EQUAL(memcmp(copy_buf.get(), orig_buf.get(), len), 0);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_small_object_copy) {
+    test_object_copy(make_minio_client, 1000, 2);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_large_object_copy) {
+    test_object_copy(make_minio_client, 1_MiB, 6);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_small_object_copy_proxy) {
+    test_object_copy(make_proxy_client, 1000, 2);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_large_object_copy_proxy) {
+    test_object_copy(make_proxy_client, 1_MiB, 6);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_creds) {

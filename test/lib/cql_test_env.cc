@@ -128,6 +128,7 @@ public:
     static constexpr std::string_view ks_name = "ks";
     static std::atomic<bool> active;
 private:
+    sharded<default_sstable_compressor_factory> _scf;
     sharded<replica::database> _db;
     sharded<gms::feature_service> _feature_service;
     sharded<sstables::storage_manager> _sstm;
@@ -656,9 +657,14 @@ private:
             auto stop_lang_manager = defer_verbose_shutdown("lang manager", [this] { _lang_manager.stop().get(); });
             _lang_manager.invoke_on_all(&lang::manager::start).get();
 
+            auto numa_groups = local_engine->smp().shard_to_numa_node_mapping();
+            _scf.start(sharded_parameter(default_sstable_compressor_factory::config::from_db_config, std::cref(*cfg), std::cref(numa_groups))).get();
+            auto stop_scf = defer_verbose_shutdown("sstable_compressor_factory", [this] {
+                _scf.stop().get();
+            });
 
             _db_config = &*cfg;
-            _db.start(std::ref(*cfg), dbcfg, std::ref(_mnotifier), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_cm), std::ref(_sstm), std::ref(_lang_manager), std::ref(_sst_dir_semaphore), std::ref(abort_sources), utils::cross_shard_barrier()).get();
+            _db.start(std::ref(*cfg), dbcfg, std::ref(_mnotifier), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_cm), std::ref(_sstm), std::ref(_lang_manager), std::ref(_sst_dir_semaphore), std::ref(_scf), std::ref(abort_sources), utils::cross_shard_barrier()).get();
             auto stop_db = defer_verbose_shutdown("database", [this] {
                 _db.stop().get();
             });
@@ -722,8 +728,11 @@ private:
                 if (!linfo.host_id) {
                     linfo.host_id = locator::host_id::create_random_id();
                 }
+                const auto location = _snitch.local()->get_location();
+                linfo.dc = location.dc;
+                linfo.rack = location.rack;
                 host_id = linfo.host_id;
-                _sys_ks.local().save_local_info(std::move(linfo), _snitch.local()->get_location(), my_address, my_address).get();
+                _sys_ks.local().save_local_info(std::move(linfo), my_address, my_address).get();
             }
             locator::shared_token_metadata::mutate_on_all_shards(_token_metadata, [hostid = host_id] (locator::token_metadata& tm) {
                 auto& topo = tm.get_topology();
@@ -877,7 +886,7 @@ private:
                     abort_sources.local(), _group0_registry.local(), _ms,
                     _gossiper.local(), _feature_service.local(), _sys_ks.local(), group0_client, scheduling_groups.gossip_scheduling_group};
 
-            auto compression_dict_updated_callback = [] { return make_ready_future<>(); };
+            auto compression_dict_updated_callback = [] (std::string_view) { return make_ready_future<>(); };
 
             _sys_dist_ks.start(std::ref(_qp), std::ref(_mm), std::ref(_proxy)).get();
 
@@ -921,7 +930,7 @@ private:
             });
 
             smp::invoke_on_all([&] {
-                return db::initialize_virtual_tables(_db, _ss, _gossiper, _group0_registry, _sys_ks, *cfg);
+                return db::initialize_virtual_tables(_db, _ss, _gossiper, _group0_registry, _sys_ks, _tablet_allocator, _ms, *cfg);
             }).get();
 
             _qp.invoke_on_all([this, &group0_client] (cql3::query_processor& qp) {

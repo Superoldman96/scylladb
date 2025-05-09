@@ -166,6 +166,11 @@ class error_injection {
                 });
             }
         }
+
+        template <typename T>
+        void set(sstring name, const T& value) {
+            parameters[name] = std::to_string(value);
+        }
     };
 
     class injection_data;
@@ -247,6 +252,14 @@ public:
                 on_internal_error(errinj_logger, "injection_shared_data is not initialized");
             }
             return _shared_data->template get<T>(std::string(key));
+        }
+
+        template <typename T>
+        void set(std::string_view key, const T& value) const {
+            if (!_shared_data) {
+                on_internal_error(errinj_logger, "injection_shared_data is not initialized");
+            }
+            return _shared_data->template set<T>(sstring(key), value);
         }
 
         friend class error_injection;
@@ -459,12 +472,18 @@ public:
     }
 
     template <typename T = std::string_view>
-    std::optional<T> inject_parameter(const std::string_view& name) {
+    std::optional<T> inject_parameter(const std::string_view& name, const std::string_view param_name) {
         auto* data = get_data(name);
         if (!data) {
             return std::nullopt;
         }
-        return data->shared_data->template get<T>("value");
+        return data->shared_data->template get<T>(std::string(param_name));
+    }
+
+    template <typename T = std::string_view>
+    [[gnu::always_inline]]
+    std::optional<T> inject_parameter(const std::string_view& name) {
+         return inject_parameter<T>(name, "value");
     }
 
     // \brief Export the value of the parameter with the given name
@@ -605,6 +624,12 @@ public:
     [[gnu::always_inline]]
     future<> inject(const std::string_view& name, utils::wait_for_message wfm) {
         return make_ready_future<>();
+    }
+
+    template <typename T>
+    [[gnu::always_inline]]
+    std::optional<T> inject_parameter(const std::string_view& name, const std::string_view param_name) {
+        return std::nullopt;
     }
 
     template <typename T>

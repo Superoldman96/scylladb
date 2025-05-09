@@ -5,37 +5,30 @@
 #
 from __future__ import annotations
 
-import glob
 import re
-import shutil
 import subprocess
-from collections.abc import Coroutine
 import threading
 import time
 import asyncio
 import logging
 import pathlib
 import os
+from collections.abc import Awaitable, Callable, Coroutine
 from functools import cache
 
 import random
 import string
 
-from typing import Callable, Awaitable, Optional, TypeVar, Any
+from typing import Optional, TypeVar, Any
 
-import universalasync
 from cassandra.cluster import NoHostAvailable, Session, Cluster # type: ignore # pylint: disable=no-name-in-module
 from cassandra.protocol import InvalidRequest # type: ignore # pylint: disable=no-name-in-module
 from cassandra.pool import Host # type: ignore # pylint: disable=no-name-in-module
+from cassandra.query import Statement # type: ignore # pylint: disable=no-name-in-module
 from cassandra import DriverException, ConsistencyLevel  # type: ignore # pylint: disable=no-name-in-module
 
-from test import TEST_RUNNER
-from test.pylib.host_registry import HostRegistry
+from test import BUILD_DIR, TOP_SRC_DIR
 from test.pylib.internal_types import ServerInfo
-from test.pylib.minio_server import MinioServer
-from test.pylib.s3_proxy import S3ProxyServer
-from test.pylib.s3_server_mock import MockS3Server
-from test.pylib.suite.base import TestSuite
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +108,12 @@ async def wait_for_cql_and_get_hosts(cql: Session, servers: list[ServerInfo], de
 
     # Take only hosts from `ip_set` (there may be more)
     hosts = [h for h in hosts if h.address in ip_set]
+
+    # Make sure `hosts` has same order as `servers`, that is: a given index will
+    # refer to the same underlying Scylla instance in both `servers` and `hosts`.
+    servers_by_ip = {srv.rpc_address: i for i, srv in enumerate(servers)}
+    hosts.sort(key=lambda x: servers_by_ip[x.address])
+
     await asyncio.gather(*(wait_for_cql(cql, h, deadline) for h in hosts))
 
     return hosts
@@ -270,19 +269,18 @@ async def wait_for_first_completed(coros: list[Coroutine]):
         await t
 
 
-def ninja(target):
-    """Build specified target using ninja"""
-    build_dir = 'build'
-    args = ['ninja', target]
-    if os.path.exists(os.path.join(build_dir, 'build.ninja')):
-        args = ['ninja', '-C', build_dir, target]
-    return subprocess.Popen(args, stdout=subprocess.PIPE).communicate()[0].decode()
+def ninja(target: str) -> str:
+    """Build specified target using ninja."""
+
+    return subprocess.Popen(
+        args=["ninja", *(["-C", str(BUILD_DIR)] if BUILD_DIR.joinpath("build.ninja").exists() else []), target],
+        stdout=subprocess.PIPE,
+        cwd=TOP_SRC_DIR,
+    ).communicate()[0].decode()
 
 
 @cache
-def get_configured_modes(root_dir=None):
-    if root_dir:
-        os.chdir(root_dir)
+def get_configured_modes() -> list[str]:
     out = ninja('mode_list')
     # [1/1] List configured modes
     # debug release dev
@@ -290,10 +288,10 @@ def get_configured_modes(root_dir=None):
                             out, count=1, flags=re.DOTALL).split('\n')[-1].split(' ')
 
 
-def get_modes_to_run(session) -> list[str]:
-    modes = session.config.getoption('modes')
+def get_modes_to_run(config) -> list[str]:
+    modes = config.getoption('modes')
     if not modes:
-        modes = get_configured_modes(root_dir=pathlib.Path(session.config.rootpath).parent)
+        modes = get_configured_modes()
     if not modes:
         raise RuntimeError('No modes configured. Please run ./configure.py first')
     return modes
@@ -316,57 +314,31 @@ async def gather_safely(*awaitables: Awaitable):
     return results
 
 
-def prepare_dir(dirname: str, pattern: str) -> None:
-    # Ensure the dir exists
-    pathlib.Path(dirname).mkdir(parents=True, exist_ok=True)
-    # Remove old artifacts
-    for p in glob.glob(os.path.join(dirname, pattern), recursive=True):
-        pathlib.Path(p).unlink()
+def get_xdist_worker_id() -> str | None:
+    return os.environ.get("PYTEST_XDIST_WORKER")
 
 
-def prepare_dirs(tempdir_base: str, modes: list[str]) -> None:
-    prepare_dir(tempdir_base, "*.log")
-    for mode in modes:
-        prepare_dir(os.path.join(tempdir_base, mode), "*.log")
-        prepare_dir(os.path.join(tempdir_base, mode), "*.reject")
-        prepare_dir(os.path.join(tempdir_base, mode, "xml"), "*.xml")
-        shutil.rmtree(os.path.join(tempdir_base, mode, "failed_test"), ignore_errors=True)
-        prepare_dir(os.path.join(tempdir_base, mode, "failed_test"), "*")
-        prepare_dir(os.path.join(tempdir_base, mode, "allure"), "*.xml")
-        if TEST_RUNNER != "pytest":
-            shutil.rmtree(os.path.join(tempdir_base, mode, "pytest"), ignore_errors=True)
-            prepare_dir(os.path.join(tempdir_base, mode, "pytest"), "*")
+def execute_with_tracing(cql : Session, statement : str | Statement, log : bool = False, *cql_execute_extra_args, **cql_execute_extra_kwargs):
+    """ Execute statement via cql session and log the tracing output. """
 
+    cql_execute_extra_kwargs['trace'] = True
+    query_result = cql.execute(statement, *cql_execute_extra_args, **cql_execute_extra_kwargs)
 
-@universalasync.async_to_sync_wraps
-async def start_s3_mock_services(minio_tempdir_base: str) -> None:
-    ms = MinioServer(
-        tempdir_base=minio_tempdir_base,
-        address="127.0.0.1",
-        logger=LogPrefixAdapter(logger=logging.getLogger("minio"), extra={"prefix": "minio"}),
-    )
-    await ms.start()
-    TestSuite.artifacts.add_exit_artifact(None, ms.stop)
+    tracing = query_result.get_all_query_traces(max_wait_sec_per=900)
 
-    hosts = HostRegistry()
-    TestSuite.artifacts.add_exit_artifact(None, hosts.cleanup)
+    ret = []
+    page_traces = []
+    for trace in tracing:
+        ret.append(trace.events)
+        if not log:
+            continue
 
-    mock_s3_server = MockS3Server(
-        host=await hosts.lease_host(),
-        port=2012,
-        logger=LogPrefixAdapter(logger=logging.getLogger("s3_mock"), extra={"prefix": "s3_mock"}),
-    )
-    await mock_s3_server.start()
-    TestSuite.artifacts.add_exit_artifact(None, mock_s3_server.stop)
+        trace_events = []
+        for event in trace.events:
+            trace_events.append(f"  {event.source} {event.source_elapsed} {event.description}")
+        page_traces.append("\n".join(trace_events))
 
-    minio_uri = f"http://{os.environ[ms.ENV_ADDRESS]}:{os.environ[ms.ENV_PORT]}"
-    proxy_s3_server = S3ProxyServer(
-        host=await hosts.lease_host(),
-        port=9002,
-        minio_uri=minio_uri,
-        max_retries=3,
-        seed=int(time.time()),
-        logger=LogPrefixAdapter(logger=logging.getLogger("s3_proxy"), extra={"prefix": "s3_proxy"}),
-    )
-    await proxy_s3_server.start()
-    TestSuite.artifacts.add_exit_artifact(None, proxy_s3_server.stop)
+    if log:
+        logger.debug("Tracing {}:\n{}\n".format(statement, "\n".join(page_traces)))
+
+    return ret

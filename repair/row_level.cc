@@ -9,6 +9,7 @@
 #include <exception>
 #include <fmt/ranges.h>
 #include <seastar/util/defer.hh>
+#include "dht/auto_refreshing_sharder.hh"
 #include "gms/endpoint_state.hh"
 #include "repair/repair.hh"
 #include "message/messaging_service.hh"
@@ -50,7 +51,7 @@
 #include "service/storage_proxy.hh"
 #include "db/batchlog_manager.hh"
 #include "idl/repair.dist.hh"
-#include "readers/empty_v2.hh"
+#include "readers/empty.hh"
 #include "readers/evictable.hh"
 #include "readers/queue.hh"
 #include "readers/filtering.hh"
@@ -365,7 +366,7 @@ repair_reader::read_mutation_fragment() {
 future<> repair_reader::on_end_of_stream() noexcept {
     co_await _reader.close();
     _permit.release_base_resources();
-    _reader = mutation_fragment_v1_stream(make_empty_flat_reader_v2(_schema, _permit));
+    _reader = mutation_fragment_v1_stream(make_empty_mutation_reader(_schema, _permit));
     _reader_handle.reset();
 }
 
@@ -486,21 +487,53 @@ mutation_fragment_queue make_mutation_fragment_queue(schema_ptr s, reader_permit
     return mutation_fragment_queue(std::move(s), std::move(permit), seastar::make_shared<queue_reader_handle_adapter>(std::move(handle)));
 }
 
+struct sharder_helper {
+    struct tablet_sharder_keepalive {
+        std::unique_ptr<dht::auto_refreshing_sharder> sharder_ptr;
+        service::topology_guard topo_guard;
+    };
+    using sharder_keepalive = std::variant<tablet_sharder_keepalive, locator::effective_replication_map_ptr>;
+
+    sharder_keepalive keepalive;
+    const dht::sharder& sharder;
+
+    sharder_helper(sharder_keepalive s_keepalive, const dht::sharder& s)
+        : keepalive(std::move(s_keepalive))
+        , sharder(s)
+    {}
+};
+
+sharder_helper get_sharder_helper(replica::table& t, const schema& s, service::frozen_topology_guard frozen_topo_guard) {
+    if (frozen_topo_guard == service::default_session_id) {
+        // The sharder is valid only when the erm is valid. Keep a reference of the erm to keep the sharder valid.
+        auto erm = t.get_effective_replication_map();
+        auto& sharder = erm->get_sharder(s);
+        sharder_helper::sharder_keepalive keepalive = std::move(erm);
+        return sharder_helper{std::move(keepalive), sharder};
+    } else {
+        sharder_helper::tablet_sharder_keepalive keepalive{
+            .sharder_ptr = std::make_unique<dht::auto_refreshing_sharder>(t.shared_from_this()),
+            .topo_guard = frozen_topo_guard
+        };
+        auto& sharder = *keepalive.sharder_ptr;
+        return sharder_helper{std::move(keepalive), sharder};
+    }
+}
+
 void repair_writer_impl::create_writer(lw_shared_ptr<repair_writer> w) {
     if (_writer_done) {
         return;
     }
     replica::table& t = _db.local().find_column_family(_schema->id());
     rlogger.debug("repair_writer: keyspace={}, table={}, estimated_partitions={}", w->schema()->ks_name(), w->schema()->cf_name(), w->get_estimated_partitions());
-    // The sharder is valid only when the erm is valid. Keep a reference of the erm to keep the sharder valid.
-    auto erm = t.get_effective_replication_map();
-    auto& sharder = erm->get_sharder(*(w->schema()));
-    _writer_done = mutation_writer::distribute_reader_and_consume_on_shards(_schema, sharder, std::move(_queue_reader),
+    auto sharder = get_sharder_helper(t, *(w->schema()), _topo_guard);
+    _writer_done = mutation_writer::distribute_reader_and_consume_on_shards(_schema, sharder.sharder, std::move(_queue_reader),
             streaming::make_streaming_consumer(sstables::repair_origin, _db, _view_builder, w->get_estimated_partitions(), _reason, is_offstrategy_supported(_reason), _topo_guard),
-    t.stream_in_progress()).then([w, erm] (uint64_t partitions) {
+    t.stream_in_progress()).then([w] (uint64_t partitions) {
         rlogger.debug("repair_writer: keyspace={}, table={}, managed to write partitions={} to sstable",
             w->schema()->ks_name(), w->schema()->cf_name(), partitions);
-    }).handle_exception([w, erm] (std::exception_ptr ep) {
+        return utils::get_local_injector().inject("repair_writer_impl_create_writer_wait", utils::wait_for_message(200s));
+    }).handle_exception([w, keepalive = std::move(sharder.keepalive)] (std::exception_ptr ep) {
         rlogger.warn("repair_writer: keyspace={}, table={}, multishard_writer failed: {}",
                 w->schema()->ks_name(), w->schema()->cf_name(), ep);
         w->queue().abort(ep);
@@ -716,7 +749,7 @@ private:
     // Contains the hashes of rows in the _working_row_buffor for all peer nodes
     std::vector<repair_hash_set> _peer_row_hash_sets;
     // Gate used to make sure pending operation of meta data is done
-    seastar::gate _gate;
+    seastar::named_gate _gate;
     sink_source_for_get_full_row_hashes _sink_source_for_get_full_row_hashes;
     sink_source_for_get_row_diff _sink_source_for_get_row_diff;
     sink_source_for_put_row_diff _sink_source_for_put_row_diff;
@@ -810,6 +843,7 @@ public:
             , _same_sharding_config(is_same_sharding_config(cf))
             , _nr_peer_nodes(nr_peer_nodes)
             , _repair_writer(make_repair_writer(_schema, _permit, _reason, _db, rs.get_view_builder(), topo_guard))
+            , _gate(format("repair_meta[{}]", repair_meta_id))
             , _sink_source_for_get_full_row_hashes(_repair_meta_id, _nr_peer_nodes,
                     [&rs] (uint32_t repair_meta_id, std::optional<shard_id> dst_cpu_id_opt, locator::host_id addr) {
                         auto dst_cpu_id = dst_cpu_id_opt.value_or(repair_unspecified_shard);
@@ -851,7 +885,7 @@ public:
             // become evictable normally).
             // Prevent this by marking the permit as evictable ASAP.
             // FIXME: provide a better API for this, this is very clunky
-            _fake_inactive_read_handle = _db.local().get_reader_concurrency_semaphore().register_inactive_read(make_empty_flat_reader_v2(_schema, _permit));
+            _fake_inactive_read_handle = _db.local().get_reader_concurrency_semaphore().register_inactive_read(make_empty_mutation_reader(_schema, _permit));
     }
 
     // follower constructor

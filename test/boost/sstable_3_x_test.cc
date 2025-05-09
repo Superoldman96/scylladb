@@ -47,18 +47,17 @@
 
 using namespace sstables;
 
-class sstable_assertions final {
+class sstable_assertions final : public sstables::test {
     test_env& _env;
-    shared_sstable _sst;
 
     sstable_assertions(test_env& env, schema_ptr schema, const sstring& path, sstable_version_types version, sstables::generation_type generation)
-        : _env(env)
-        , _sst(_env.make_sstable(std::move(schema),
+        : test(env.make_sstable(std::move(schema),
                             path,
                             generation,
                             version,
                             sstable_format_types::big,
                             1))
+        , _env(env)
     { }
 public:
     sstable_assertions(test_env& env, schema_ptr schema, const sstring& path)
@@ -72,18 +71,6 @@ public:
     test_env& get_env() {
         return _env;
     }
-    void read_toc() {
-        _sst->read_toc().get();
-    }
-    void read_summary() {
-        _sst->read_summary().get();
-    }
-    void read_filter() {
-        _sst->read_filter().get();
-    }
-    void read_statistics() {
-        _sst->read_statistics().get();
-    }
     void load() {
         _sst->load(_sst->get_schema()->get_sharder()).get();
     }
@@ -95,12 +82,8 @@ public:
         return _sst->make_reader(_sst->_schema, _env.make_reader_permit(), query::full_partition_range, _sst->_schema->full_slice());
     }
 
-    const stats_metadata& get_stats_metadata() const {
-        return _sst->get_stats_metadata();
-    }
-
-    const shared_sstable get_sstable() const noexcept {
-        return _sst;
+    const sstable* operator->() const noexcept {
+        return &*_sst;
     }
 
     mutation_reader make_reader(
@@ -1737,24 +1720,26 @@ SEASTAR_TEST_CASE(test_uncompressed_partition_key_with_values_of_different_types
 
 SEASTAR_TEST_CASE(test_lz4_partition_key_with_values_of_different_types_read) {
     return test_partition_key_with_values_of_different_types_read(
-        LZ4_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compressor::lz4);
+        LZ4_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compression_parameters::algorithm::lz4);
 }
 
 SEASTAR_TEST_CASE(test_snappy_partition_key_with_values_of_different_types_read) {
     return test_partition_key_with_values_of_different_types_read(
-        SNAPPY_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compressor::snappy);
+        SNAPPY_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compression_parameters::algorithm::snappy);
 }
 
 SEASTAR_TEST_CASE(test_deflate_partition_key_with_values_of_different_types_read) {
     return test_partition_key_with_values_of_different_types_read(
-        DEFLATE_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compressor::deflate);
+        DEFLATE_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compression_parameters::algorithm::deflate);
 }
 
 SEASTAR_TEST_CASE(test_zstd_partition_key_with_values_of_different_types_read) {
     return test_partition_key_with_values_of_different_types_read(
-        ZSTD_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compressor::create({
+        ZSTD_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, std::map<sstring, sstring>{
             {"sstable_compression", "org.apache.cassandra.io.compress.ZstdCompressor"},
-            {"compression_level", "1"}}));
+            {"compression_level", "1"}
+        }
+    );
 }
 
 // Following test runs on files in test/resource/sstables/3.x/zstd/multiple_chunks.
@@ -1778,10 +1763,10 @@ static schema_ptr make_zstd_multiple_chunks_schema() {
     return schema_builder("test_ks", "test_table")
         .with_column("val1", int32_type, column_kind::partition_key)
         .with_column("val2", int32_type, column_kind::clustering_key)
-        .set_compressor_params(compression_parameters{compressor::create({
+        .set_compressor_params(compression_parameters{std::map<sstring, sstring>{
             {"sstable_compression", "org.apache.cassandra.io.compress.ZstdCompressor"},
             {"compression_level", "5"},
-            {"chunk_length_in_kb", "4"}})})
+            {"chunk_length_in_kb", "4"}}})
         .build();
 }
 
@@ -2647,7 +2632,7 @@ static thread_local const schema_ptr UNCOMPRESSED_SIMPLE_SCHEMA =
 SEASTAR_TEST_CASE(test_uncompressed_simple_read_toc) {
   return test_env::do_with_async([] (test_env& env) {
     sstable_assertions sst(env, UNCOMPRESSED_SIMPLE_SCHEMA, UNCOMPRESSED_SIMPLE_PATH);
-    sst.read_toc();
+    sst.read_toc().get();
     using ct = component_type;
     sst.assert_toc({ct::Index,
                     ct::Data,
@@ -2663,24 +2648,24 @@ SEASTAR_TEST_CASE(test_uncompressed_simple_read_toc) {
 SEASTAR_TEST_CASE(test_uncompressed_simple_read_summary) {
   return test_env::do_with_async([] (test_env& env) {
     sstable_assertions sst(env, UNCOMPRESSED_SIMPLE_SCHEMA, UNCOMPRESSED_SIMPLE_PATH);
-    sst.read_toc();
-    sst.read_summary();
+    sst.read_toc().get();
+    sst.read_summary().get();
   });
 }
 
 SEASTAR_TEST_CASE(test_uncompressed_simple_read_filter) {
   return test_env::do_with_async([] (test_env& env) {
     sstable_assertions sst(env, UNCOMPRESSED_SIMPLE_SCHEMA, UNCOMPRESSED_SIMPLE_PATH);
-    sst.read_toc();
-    sst.read_filter();
+    sst.read_toc().get();
+    sst.read_filter().get();
   });
 }
 
 SEASTAR_TEST_CASE(test_uncompressed_simple_read_statistics) {
   return test_env::do_with_async([] (test_env& env) {
     sstable_assertions sst(env, UNCOMPRESSED_SIMPLE_SCHEMA, UNCOMPRESSED_SIMPLE_PATH);
-    sst.read_toc();
-    sst.read_statistics();
+    sst.read_toc().get();
+    sst.read_statistics().get();
   });
 }
 
@@ -3207,8 +3192,8 @@ static sstables::shared_sstable write_sstables(test_env& env, schema_ptr s, lw_s
 
     sst->write_components(make_combined_reader(s,
         env.make_reader_permit(),
-        mt1->make_flat_reader(s, env.make_reader_permit()),
-        mt2->make_flat_reader(s, env.make_reader_permit())), 1, s, env.manager().configure_writer(), mt1->get_encoding_stats()).get();
+        mt1->make_mutation_reader(s, env.make_reader_permit()),
+        mt2->make_mutation_reader(s, env.make_reader_permit())), 1, s, env.manager().configure_writer(), mt1->get_encoding_stats()).get();
     return sst;
 }
 
@@ -3284,7 +3269,7 @@ static void do_validate_stats_metadata(schema_ptr s, sstable_assertions& written
     auto orig_sst = written_sst.get_env().reusable_sst(s, get_write_test_path(table_name), 1, sstable_version_types::mc).get();
 
     const auto& orig_stats = orig_sst->get_stats_metadata();
-    const auto& written_stats = written_sst.get_stats_metadata();
+    const auto& written_stats = written_sst->get_stats_metadata();
 
     auto check_estimated_histogram = [] (const utils::estimated_histogram& lhs, const utils::estimated_histogram& rhs) {
         BOOST_REQUIRE(lhs.bucket_offsets == rhs.bucket_offsets);
@@ -3299,7 +3284,7 @@ static void do_validate_stats_metadata(schema_ptr s, sstable_assertions& written
     BOOST_REQUIRE_EQUAL(orig_stats.max_local_deletion_time, written_stats.max_local_deletion_time);
     BOOST_REQUIRE_EQUAL(orig_stats.min_ttl, written_stats.min_ttl);
     BOOST_REQUIRE_EQUAL(orig_stats.max_ttl, written_stats.max_ttl);
-    if (orig_sst->has_correct_min_max_column_names() && written_sst.get_sstable()->has_correct_min_max_column_names()) {
+    if (orig_sst->has_correct_min_max_column_names() && written_sst->has_correct_min_max_column_names()) {
         BOOST_REQUIRE(orig_stats.min_column_names.elements == written_stats.min_column_names.elements);
         BOOST_REQUIRE(orig_stats.max_column_names.elements == written_stats.max_column_names.elements);
     }
@@ -3310,7 +3295,7 @@ static void do_validate_stats_metadata(schema_ptr s, sstable_assertions& written
 }
 
 static void check_min_max_column_names(sstable_assertions& written_sst, std::vector<bytes> min_components, std::vector<bytes> max_components) {
-    const auto& st = written_sst.get_stats_metadata();
+    const auto& st = written_sst->get_stats_metadata();
     BOOST_TEST_MESSAGE(fmt::format("min {}/{} max {}/{}", st.min_column_names.elements.size(), min_components.size(), st.max_column_names.elements.size(), max_components.size()));
     BOOST_REQUIRE(st.min_column_names.elements.size() == min_components.size());
     for (auto i = 0U; i < st.min_column_names.elements.size(); i++) {
@@ -3700,7 +3685,7 @@ static future<> test_write_many_partitions(sstring table_name, tombstone partiti
         }
     }
 
-    bool compressed = cp.get_compressor() != nullptr;
+    bool compressed = cp.get_algorithm() != compression_parameters::algorithm::none;
     for (auto version : test_sstable_versions) {
         lw_shared_ptr<replica::memtable> mt = make_memtable(s, muts);
         auto sst = compressed ? write_sstables(env, s, mt, version) : write_and_compare_sstables(env, s, mt, table_name, version);
@@ -3728,30 +3713,30 @@ SEASTAR_TEST_CASE(test_write_many_partitions_lz4) {
     return test_write_many_partitions(
             "many_partitions_lz4",
             tombstone{},
-            compression_parameters{compressor::lz4});
+            compression_parameters{compression_parameters::algorithm::lz4});
 }
 
 SEASTAR_TEST_CASE(test_write_many_partitions_snappy) {
     return test_write_many_partitions(
             "many_partitions_snappy",
             tombstone{},
-            compression_parameters{compressor::snappy});
+            compression_parameters{compression_parameters::algorithm::snappy});
 }
 
 SEASTAR_TEST_CASE(test_write_many_partitions_deflate) {
     return test_write_many_partitions(
             "many_partitions_deflate",
             tombstone{},
-            compression_parameters{compressor::deflate});
+            compression_parameters{compression_parameters::algorithm::deflate});
 }
 
 SEASTAR_TEST_CASE(test_write_many_partitions_zstd) {
     return test_write_many_partitions(
             "many_partitions_zstd",
             tombstone{},
-            compression_parameters{compressor::create({
+            compression_parameters{std::map<sstring, sstring>{
                 {"sstable_compression", "org.apache.cassandra.io.compress.ZstdCompressor"}
-            })});
+            }});
 }
 
 SEASTAR_TEST_CASE(test_write_multiple_rows) {
@@ -5162,7 +5147,7 @@ static void test_sstable_write_large_row_f(schema_ptr s, reader_permit permit, r
         // trigger depends on the size of rows after they are written in the MC format and that size
         // depends on the encoding statistics (because of variable-length encoding). The original values
         // were chosen with the default-constructed encoding_stats, so let's keep it that way.
-        sst->write_components(mt.make_flat_reader(s, std::move(permit)), 1, s, env.manager().configure_writer("test"), encoding_stats{}).get();
+        sst->write_components(mt.make_mutation_reader(s, std::move(permit)), 1, s, env.manager().configure_writer("test"), encoding_stats{}).get();
         BOOST_REQUIRE_EQUAL(i, expected.size());
     }, { &handler }).get();
 }
@@ -5216,7 +5201,7 @@ static void test_sstable_write_large_cell_f(schema_ptr s, reader_permit permit, 
         // trigger depends on the size of rows after they are written in the MC format and that size
         // depends on the encoding statistics (because of variable-length encoding). The original values
         // were chosen with the default-constructed encoding_stats, so let's keep it that way.
-        sst->write_components(mt.make_flat_reader(s, std::move(permit)), 1, s, env.manager().configure_writer("test"), encoding_stats{}).get();
+        sst->write_components(mt.make_mutation_reader(s, std::move(permit)), 1, s, env.manager().configure_writer("test"), encoding_stats{}).get();
         BOOST_REQUIRE_EQUAL(i, expected.size());
     }, { &handler }).get();
 }
@@ -5275,7 +5260,7 @@ static void test_sstable_log_too_many_rows_f(int rows, int range_tombstones, uin
 
     sstables::test_env::do_with_async([&] (auto& env) {
         auto sst = env.make_sstable(sc, version);
-        sst->write_components(mt->make_flat_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
+        sst->write_components(mt->make_mutation_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
 
         BOOST_REQUIRE_EQUAL(logged, expected);
     }, { &handler }).get();
@@ -5388,7 +5373,7 @@ static void test_sstable_log_too_many_dead_rows_f(int rows, uint64_t threshold, 
 
     sstables::test_env::do_with_async([&] (auto& env) {
         auto sst = env.make_sstable(sc, version);
-        sst->write_components(mt->make_flat_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
+        sst->write_components(mt->make_mutation_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
 
         BOOST_REQUIRE_EQUAL(logged, expected);
     }, { &handler }).get();
@@ -5440,7 +5425,7 @@ static void test_sstable_too_many_collection_elements_f(int elements, uint64_t t
 
     sstables::test_env::do_with_async([&] (auto& env) {
         auto sst = env.make_sstable(sc, version);
-        sst->write_components(mt->make_flat_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
+        sst->write_components(mt->make_mutation_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
 
         BOOST_REQUIRE_EQUAL(logged, expected);
     }, { &handler }).get();
@@ -5639,7 +5624,7 @@ SEASTAR_TEST_CASE(test_alter_bloom_fp_chance_during_write) {
         mt->apply(m);
 
         auto sst = env.make_sstable(s2, sstable_version_types::me);
-        sst->write_components(mt->make_flat_reader(s1, env.make_reader_permit()), 1, s1, env.manager().configure_writer(), mt->get_encoding_stats()).get();
+        sst->write_components(mt->make_mutation_reader(s1, env.make_reader_permit()), 1, s1, env.manager().configure_writer(), mt->get_encoding_stats()).get();
 
         sstable_assertions sa(env, sst);
         sa.load();
@@ -5679,7 +5664,7 @@ SEASTAR_TEST_CASE(test_alter_compression_during_write) {
         mt->apply(m);
 
         auto sst = env.make_sstable(s2, sstable_version_types::me);
-        sst->write_components(mt->make_flat_reader(s1, env.make_reader_permit()), 1, s1, env.manager().configure_writer(), mt->get_encoding_stats()).get();
+        sst->write_components(mt->make_mutation_reader(s1, env.make_reader_permit()), 1, s1, env.manager().configure_writer(), mt->get_encoding_stats()).get();
 
         sstable_assertions sa(env, sst);
         sa.load();

@@ -556,6 +556,9 @@ class load_balancer {
         // If we cancel a split, that's because average size dropped so much a merge would be
         // required post completion, and vice-versa.
         bool table_needs_resize_cancellation(const table_size_desc& d) const {
+            if (utils::get_local_injector().enter("force_resize_cancellation")) {
+                return true;
+            }
             return d.resize_decision.split_or_merge() && to_resize_decision(d).way != d.resize_decision.way;
         }
 
@@ -663,6 +666,8 @@ private:
                 return true;
             case tablet_transition_stage::streaming:
                 return true;
+            case tablet_transition_stage::rebuild_repair:
+                return true;
             case tablet_transition_stage::repair:
                 return true;
             case tablet_transition_stage::end_repair:
@@ -730,11 +735,14 @@ public:
             plan.merge(std::move(dc_plan));
         }
 
-        // Make plans for repair jobs
-        plan.set_repair_plan(co_await make_repair_plan(plan));
-
         // Merge table-wide resize decisions, may emit new decisions, revoke or finalize ongoing ones.
+        // Note : Resize plans should be generated before repair plans to avoid scheduling repairs when there is pending resize finalization
         plan.merge_resize_plan(co_await make_resize_plan(plan));
+
+        // Skip making repair plans if resize finalizations are pending, since repairs could delay finalization.
+        if (plan.resize_plan().finalize_resize.empty()) {
+            plan.set_repair_plan(co_await make_repair_plan(plan));
+        }
 
         auto level = plan.size() > 0 ? seastar::log_level::info : seastar::log_level::debug;
         lblogger.log(level, "Prepared {} migration plans, out of which there were {} tablet migration(s) and {} resize decision(s) and {} tablet repair(s)",
@@ -2400,6 +2408,7 @@ public:
                 max_shard_load = std::max(max_shard_load, load);
                 this_node_max_shard_load = std::max(this_node_max_shard_load, load);
             }
+            node_load /= node.shard_count;
             lblogger.debug("Load on host {} for table {}: total={}, max={}", host, table, node_load, this_node_max_shard_load);
         }
         auto avg_load = double(total_load) / shard_count;
@@ -2645,7 +2654,7 @@ public:
 
             tablet_transition_kind kind = (src_node_info.state() == locator::node::state::being_removed
                                            || src_node_info.state() == locator::node::state::left)
-                       ? tablet_transition_kind::rebuild : tablet_transition_kind::migration;
+                       ? locator::choose_rebuild_transition_kind(_db.features()) : tablet_transition_kind::migration;
             auto mig = get_migration_info(source_tablets, kind, src, dst);
             auto mig_streaming_info = get_migration_streaming_infos(topo, tmap, mig);
 
@@ -3073,6 +3082,7 @@ class tablet_allocator_impl : public tablet_allocator::impl
     load_balancer_stats_manager _load_balancer_stats;
     bool _stopped = false;
     bool _use_tablet_aware_balancing = true;
+    locator::load_stats_ptr _load_stats;
 private:
     load_balancer make_load_balancer(token_metadata_ptr tm,
             locator::load_stats_ptr table_load_stats,
@@ -3105,8 +3115,16 @@ public:
     }
 
     future<migration_plan> balance_tablets(token_metadata_ptr tm, locator::load_stats_ptr table_load_stats, std::unordered_set<host_id> skiplist) {
-        auto lb = make_load_balancer(tm, std::move(table_load_stats), std::move(skiplist));
+        auto lb = make_load_balancer(tm, table_load_stats ? table_load_stats : _load_stats, std::move(skiplist));
         co_return co_await lb.make_plan();
+    }
+
+    void set_load_stats(locator::load_stats_ptr load_stats) {
+        _load_stats = std::move(load_stats);
+    }
+
+    locator::load_stats_ptr get_load_stats() {
+        return _load_stats;
     }
 
     void set_use_tablet_aware_balancing(bool use_tablet_aware_balancing) {
@@ -3156,6 +3174,7 @@ public:
 
     void on_leadership_lost() {
         _load_balancer_stats.unregister();
+        _load_stats = {};
     }
 
     load_balancer_stats_manager& stats() {
@@ -3265,6 +3284,14 @@ future<> tablet_allocator::stop() {
 
 future<migration_plan> tablet_allocator::balance_tablets(locator::token_metadata_ptr tm, locator::load_stats_ptr load_stats, std::unordered_set<host_id> skiplist) {
     return impl().balance_tablets(std::move(tm), std::move(load_stats), std::move(skiplist));
+}
+
+void tablet_allocator::set_load_stats(locator::load_stats_ptr load_stats) {
+    impl().set_load_stats(std::move(load_stats));
+}
+
+locator::load_stats_ptr tablet_allocator::get_load_stats() {
+    return impl().get_load_stats();
 }
 
 void tablet_allocator::set_use_table_aware_balancing(bool use_tablet_aware_balancing) {

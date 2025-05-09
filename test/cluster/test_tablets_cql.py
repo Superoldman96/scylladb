@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 @skip_mode('release', 'error injections are not supported in release mode')
 async def test_alter_dropped_tablets_keyspace(manager: ManagerClient) -> None:
     config = {
-        'enable_tablets': 'true'
+        'tablets_mode_for_new_keyspaces': 'enabled'
     }
 
     logger.info("starting a node (the leader)")
@@ -65,14 +65,14 @@ async def test_alter_dropped_tablets_keyspace(manager: ManagerClient) -> None:
                                          f"data_dictionary::no_such_keyspace \(Can't find a keyspace {ks}\)")
     assert not matches
 
-    with pytest.raises(InvalidRequest, match=f"Can't ALTER keyspace {ks}, keyspace doesn't exist") as e:
+    with pytest.raises(InvalidRequest, match=f"Can't ALTER keyspace {ks}, keyspace doesn't exist|Can't find a keyspace {ks}") as e:
         await task
 
 @pytest.mark.asyncio
 @skip_mode('release', 'error injections are not supported in release mode')
 async def test_alter_tablets_keyspace_concurrent_modification(manager: ManagerClient) -> None:
     config = {
-        'enable_tablets': 'true'
+        'tablets_mode_for_new_keyspaces': 'enabled'
     }
 
     logger.info("starting a node (the leader)")

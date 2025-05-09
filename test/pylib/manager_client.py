@@ -12,7 +12,7 @@ import pathlib
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Callable, Any, Awaitable, Dict, Tuple
+from typing import List, Optional, Callable, Any, Awaitable, Dict, Tuple, Union
 from time import time
 import logging
 from test.pylib.log_browsing import ScyllaLogFile
@@ -22,7 +22,7 @@ from test.pylib.internal_types import ServerNum, IPAddress, HostID, ServerInfo, 
 from test.pylib.scylla_cluster import ReplaceConfig, ScyllaServer
 from cassandra.cluster import Session as CassandraSession, \
     ExecutionProfile, EXEC_PROFILE_DEFAULT  # type: ignore # pylint: disable=no-name-in-module
-from cassandra.policies import WhiteListRoundRobinPolicy
+from cassandra.policies import LoadBalancingPolicy, RoundRobinPolicy, WhiteListRoundRobinPolicy
 from cassandra.cluster import Cluster as CassandraCluster  # type: ignore # pylint: disable=no-name-in-module
 from cassandra.auth import AuthProvider
 import aiohttp
@@ -41,12 +41,13 @@ class ManagerClient():
     # pylint: disable=too-many-public-methods
 
     def __init__(self, sock_path: str, port: int, use_ssl: bool, auth_provider: Any|None,
-                 con_gen: Callable[[List[IPAddress], int, bool, Any], CassandraSession]) \
+                 con_gen: Callable[[List[IPAddress], int, bool, Any, LoadBalancingPolicy], CassandraCluster]) \
                          -> None:
         self.test_log_fh: Optional[logging.FileHandler] = None
         self.port = port
         self.use_ssl = use_ssl
         self.auth_provider = auth_provider
+        self.load_balancing_policy = RoundRobinPolicy()
         self.con_gen = con_gen
         self.ccluster: Optional[CassandraCluster] = None
         self.cql: Optional[CassandraSession] = None
@@ -88,7 +89,7 @@ class ManagerClient():
         self.driver_close()
         logger.debug("driver connecting to %s", servers)
         self.ccluster = self.con_gen(servers, self.port, self.use_ssl,
-                                     auth_provider if auth_provider else self.auth_provider)
+                                     auth_provider if auth_provider else self.auth_provider, self.load_balancing_policy)
         self.cql = self.ccluster.connect()
 
     def driver_close(self) -> None:
@@ -113,6 +114,12 @@ class ManagerClient():
         await self.servers_see_each_other(servers)
         hosts = await wait_for_cql_and_get_hosts(cql, servers, time() + 60)
         return cql, hosts
+
+    async def get_cql_exclusive(self, server: ServerInfo):
+        cql = self.con_gen([server.ip_addr], self.port, self.use_ssl, self.auth_provider,
+                                     WhiteListRoundRobinPolicy([server.ip_addr])).connect()
+        await wait_for_cql_and_get_hosts(cql, [server], time() + 60)
+        return cql
 
     # Make driver update endpoints from remote connection
     def _driver_update(self) -> None:
@@ -297,7 +304,7 @@ class ManagerClient():
                                 replace_cfg: Optional[ReplaceConfig],
                                 cmdline: Optional[List[str]],
                                 config: Optional[dict[str, Any]],
-                                property_file: Optional[dict[str, Any]],
+                                property_file: Union[List[dict[str, Any]], dict[str, Any], None],
                                 start: bool,
                                 seeds: Optional[List[IPAddress]],
                                 expected_error: Optional[str],
@@ -380,17 +387,22 @@ class ManagerClient():
     async def servers_add(self, servers_num: int = 1,
                           cmdline: Optional[List[str]] = None,
                           config: Optional[dict[str, Any]] = None,
-                          property_file: Optional[dict[str, Any]] = None,
+                          property_file: Union[List[dict[str, Any]], dict[str, Any], None] = None,
                           start: bool = True,
                           seeds: Optional[List[IPAddress]] = None,
                           driver_connect_opts: dict[str, Any] = {},
                           expected_error: Optional[str] = None,
-                          server_encryption: str = "none") -> List[ServerInfo]:
+                          server_encryption: str = "none",
+                          auto_rack_dc: Optional[str] = None) -> List[ServerInfo]:
         """Add new servers concurrently.
         This function can be called only if the cluster uses consistent topology changes, which support
         concurrent bootstraps. If your test does not fulfill this condition and you want to add multiple
         servers, you should use multiple server_add calls."""
         assert servers_num > 0, f"servers_add: cannot add {servers_num} servers, servers_num must be positive"
+        assert not (property_file and auto_rack_dc), f"Either property_file or auto_rack_dc can be provided, but not both"
+
+        if auto_rack_dc:
+            property_file = [{"dc":auto_rack_dc, "rack":f"rack{i+1}"} for i in range(servers_num)]
 
         try:
             data = self._create_server_add_data(None, cmdline, config, property_file, start, seeds, expected_error, server_encryption, None)

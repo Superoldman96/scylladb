@@ -54,8 +54,8 @@
 #include "locator/tablets.hh"
 
 #include "utils/error_injection.hh"
-#include "readers/reversing_v2.hh"
-#include "readers/empty_v2.hh"
+#include "readers/reversing.hh"
+#include "readers/empty.hh"
 #include "readers/multi_range.hh"
 #include "readers/combined.hh"
 #include "readers/compacting.hh"
@@ -128,11 +128,8 @@ lw_shared_ptr<const sstables::sstable_set> table::make_compound_sstable_set() co
     return _sg_manager->make_sstable_set();
 }
 
-lw_shared_ptr<sstables::sstable_set> table::make_maintenance_sstable_set() const {
-    // Level metadata is not used because (level 0) maintenance sstables are disjoint and must be stored for efficient retrieval in the partitioned set
-    bool use_level_metadata = false;
-    return make_lw_shared<sstables::sstable_set>(
-            sstables::make_partitioned_sstable_set(_schema, use_level_metadata));
+lw_shared_ptr<sstables::sstable_set> compaction_group::make_maintenance_sstable_set() const {
+    return make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(_t.schema(), token_range()));
 }
 
 void table::refresh_compound_sstable_set() {
@@ -182,7 +179,7 @@ table::add_memtables_to_reader_list(std::vector<mutation_reader>& readers,
         std::function<void(size_t)> reserve_fn) const {
     auto add_memtables_from_cg = [&] (compaction_group& cg) mutable {
         for (auto&& mt: *cg.memtables()) {
-            if (auto reader_opt = mt->make_flat_reader_opt(s, permit, range, slice, trace_state, fwd, fwd_mr)) {
+            if (auto reader_opt = mt->make_mutation_reader_opt(s, permit, range, slice, trace_state, fwd, fwd_mr)) {
                 readers.emplace_back(std::move(*reader_opt));
             }
         }
@@ -199,10 +196,12 @@ table::add_memtables_to_reader_list(std::vector<mutation_reader>& readers,
         return;
     }
     auto token_range = range.transform(std::mem_fn(&dht::ring_position::token));
-    auto cgs = compaction_groups_for_token_range(token_range);
-    reserve_fn(std::ranges::fold_left(cgs | std::views::transform(std::mem_fn(&compaction_group::memtable_count)), uint64_t(0), std::plus{}));
-    for (auto& cg : cgs) {
-        add_memtables_from_cg(*cg);
+    auto sgs = storage_groups_for_token_range(token_range);
+    reserve_fn(std::ranges::fold_left(sgs | std::views::transform(std::mem_fn(&storage_group::memtable_count)), uint64_t(0), std::plus{}));
+    for (auto& sg : sgs) {
+        for (auto& cg : sg->compaction_groups()) {
+            add_memtables_from_cg(*cg);
+        }
     }
 }
 
@@ -246,7 +245,8 @@ table::make_reader_v2(schema_ptr s,
 
     const auto bypass_cache = slice.options.contains(query::partition_slice::option::bypass_cache);
     if (cache_enabled() && !bypass_cache) {
-        if (auto reader_opt = _cache.make_reader_opt(s, permit, range, slice, &_compaction_manager.get_tombstone_gc_state(), std::move(trace_state), fwd, fwd_mr)) {
+        if (auto reader_opt = _cache.make_reader_opt(s, permit, range, slice, &_compaction_manager.get_tombstone_gc_state(),
+                    get_max_purgeable_fn_for_cache_underlying_reader(), std::move(trace_state), fwd, fwd_mr)) {
             readers.emplace_back(std::move(*reader_opt));
         }
     } else {
@@ -549,6 +549,10 @@ const lw_shared_ptr<sstables::sstable_set>& compaction_group::main_sstables() co
     return _main_sstables;
 }
 
+sstables::sstable_set compaction_group::make_main_sstable_set() const {
+    return _t._compaction_strategy.make_sstable_set(as_table_state());
+}
+
 void compaction_group::set_main_sstables(lw_shared_ptr<sstables::sstable_set> new_main_sstables) {
     _main_sstables = std::move(new_main_sstables);
 }
@@ -668,7 +672,7 @@ storage_group* storage_group_manager::maybe_storage_group_for_id(const schema_pt
 
 class single_storage_group_manager final : public storage_group_manager {
     replica::table& _t;
-    storage_group* _single_sg;
+    storage_group_ptr _single_sg;
     compaction_group* _single_cg;
 
     compaction_group& get_compaction_group() const noexcept {
@@ -679,10 +683,16 @@ public:
         : _t(t)
     {
         storage_group_map r;
-        auto cg = make_lw_shared<compaction_group>(_t, size_t(0), dht::token_range::make_open_ended_both_sides());
+        // this might not reflect real vnode range for this node, but with 256 tokens, the actual
+        // first and last tokens are likely to be ~0.5% of the edges, so any measurement against
+        // this accurate enough token range will be likely up to ~1% off.
+        // TODO: we could fed actual vnode range here, but we might bump into a chicken and egg
+        //     problem if e.g. a system table is created before tokens were allocated.
+        auto full_token_range = dht::token_range::make(dht::first_token(), dht::last_token());
+        auto cg = make_lw_shared<compaction_group>(_t, size_t(0), std::move(full_token_range));
         _single_cg = cg.get();
         auto sg = make_lw_shared<storage_group>(std::move(cg));
-        _single_sg = sg.get();
+        _single_sg = sg;
         r[0] = std::move(sg);
         _storage_groups = std::move(r);
     }
@@ -696,9 +706,9 @@ public:
     compaction_group& compaction_group_for_token(dht::token token) const override {
         return get_compaction_group();
     }
-    utils::chunked_vector<compaction_group*> compaction_groups_for_token_range(dht::token_range tr) const override {
-        utils::chunked_vector<compaction_group*> ret;
-        ret.push_back(&get_compaction_group());
+    utils::chunked_vector<storage_group_ptr> storage_groups_for_token_range(dht::token_range tr) const override {
+        utils::chunked_vector<storage_group_ptr> ret;
+        ret.push_back(_single_sg);
         return ret;
     }
     compaction_group& compaction_group_for_key(partition_key_view key, const schema_ptr& s) const override {
@@ -841,7 +851,7 @@ public:
     void update_effective_replication_map(const locator::effective_replication_map& erm, noncopyable_function<void()> refresh_mutation_source) override;
 
     compaction_group& compaction_group_for_token(dht::token token) const override;
-    utils::chunked_vector<compaction_group*> compaction_groups_for_token_range(dht::token_range tr) const override;
+    utils::chunked_vector<storage_group_ptr> storage_groups_for_token_range(dht::token_range tr) const override;
     compaction_group& compaction_group_for_key(partition_key_view key, const schema_ptr& s) const override;
     compaction_group& compaction_group_for_sstable(const sstables::shared_sstable& sst) const override;
 
@@ -872,7 +882,9 @@ bool table::uses_tablets() const {
 }
 
 storage_group::storage_group(compaction_group_ptr cg)
-        : _main_cg(std::move(cg)) {
+        : _main_cg(cg)
+        , _async_gate(format("[storage_group {}.{} {}]", cg->as_table_state().schema()->ks_name(), cg->as_table_state().schema()->cf_name(), cg->group_id()))
+{
 }
 
 const dht::token_range& storage_group::token_range() const noexcept {
@@ -1145,8 +1157,8 @@ compaction_group& table::compaction_group_for_token(dht::token token) const {
     return _sg_manager->compaction_group_for_token(token);
 }
 
-utils::chunked_vector<compaction_group*> tablet_storage_group_manager::compaction_groups_for_token_range(dht::token_range tr) const {
-    utils::chunked_vector<compaction_group*> ret;
+utils::chunked_vector<storage_group_ptr> tablet_storage_group_manager::storage_groups_for_token_range(dht::token_range tr) const {
+    utils::chunked_vector<storage_group_ptr> ret;
     auto cmp = dht::token_comparator();
 
     size_t candidate_start = tr.start() ? tablet_id_for_token(tr.start()->value()) : size_t(0);
@@ -1158,18 +1170,16 @@ utils::chunked_vector<compaction_group*> tablet_storage_group_manager::compactio
             continue;
         }
         auto& sg = it->second;
-        for (auto& cg : sg->compaction_groups()) {
-            if (cg && tr.overlaps(cg->token_range(), cmp)) {
-                ret.push_back(cg.get());
-            }
+        if (sg && tr.overlaps(sg->token_range(), cmp)) {
+            ret.push_back(sg);
         }
     }
 
     return ret;
 }
 
-utils::chunked_vector<compaction_group*> table::compaction_groups_for_token_range(dht::token_range tr) const {
-    return _sg_manager->compaction_groups_for_token_range(tr);
+utils::chunked_vector<storage_group_ptr> table::storage_groups_for_token_range(dht::token_range tr) const {
+    return _sg_manager->storage_groups_for_token_range(tr);
 }
 
 compaction_group& tablet_storage_group_manager::compaction_group_for_key(partition_key_view key, const schema_ptr& s) const {
@@ -1248,29 +1258,27 @@ const storage_group_map& table::storage_groups() const {
     return _sg_manager->storage_groups();
 }
 
-future<> table::safe_foreach_sstable(const sstables::sstable_set& set, noncopyable_function<future<>(const sstables::shared_sstable&)> action) {
-    auto deletion_guard = co_await get_sstable_list_permit();
-
-    co_await set.for_each_sstable_gently([&] (const sstables::shared_sstable& sst) -> future<> {
-        return action(sst);
-    });
-}
-
 future<utils::chunked_vector<sstables::sstable_files_snapshot>> table::take_storage_snapshot(dht::token_range tr) {
     utils::chunked_vector<sstables::sstable_files_snapshot> ret;
 
-    for (auto& cg : compaction_groups_for_token_range(tr)) {
+    for (auto& sg : storage_groups_for_token_range(tr)) {
+        co_await utils::get_local_injector().inject("take_storage_snapshot", utils::wait_for_message(60s));
+
         // We don't care about sstables in snapshot being unlinked, as the file
         // descriptors remain opened until last reference to them are gone.
         // Also, we should be careful with taking a deletion lock here as a
         // deadlock might occur due to memtable flush backpressure waiting on
         // compaction to reduce the backlog.
 
-        co_await cg->flush();
+        co_await sg->flush();
 
-        auto set = cg->make_sstable_set();
-
-        co_await safe_foreach_sstable(*set, [&] (const sstables::shared_sstable& sst) -> future<> {
+        // The sstable set must be obtained *after* the deletion lock is taken,
+        // otherwise components of sstables in the set might be unlinked from the filesystem
+        // by compaction while we are waiting for the lock.
+        auto deletion_guard = co_await get_sstable_list_permit();
+        // It's vital that we build a set on the storage group level, since sstables
+        // might move across compaction groups in the background.
+        co_await sg->make_sstable_set()->for_each_sstable_gently([&] (const sstables::shared_sstable& sst) -> future<> {
            ret.push_back({
                .sst = sst,
                .files = co_await sst->readable_file_for_all_components(),
@@ -1281,6 +1289,15 @@ future<utils::chunked_vector<sstables::sstable_files_snapshot>> table::take_stor
     co_return std::move(ret);
 }
 
+future<utils::chunked_vector<sstables::shared_sstable>> table::take_sstable_set_snapshot() {
+    auto deletion_guard = co_await get_sstable_list_permit();
+    utils::chunked_vector<sstables::shared_sstable> result;
+    co_await get_sstable_set().for_each_sstable_gently([&] (sstables::shared_sstable sst) {
+        result.push_back(sst);
+    });
+    co_return result;
+}
+
 future<utils::chunked_vector<sstables::entry_descriptor>>
 table::clone_tablet_storage(locator::tablet_id tid) {
     utils::chunked_vector<sstables::entry_descriptor> ret;
@@ -1289,8 +1306,11 @@ table::clone_tablet_storage(locator::tablet_id tid) {
     auto& sg = storage_group_for_id(tid.value());
     auto sg_holder = sg.async_gate().hold();
     co_await sg.flush();
-    auto set = sg.make_sstable_set();
-    co_await safe_foreach_sstable(*set, [&] (const sstables::shared_sstable& sst) -> future<> {
+    // The sstable set must be obtained *after* the deletion lock is taken,
+    // otherwise components of sstables in the set might be unlinked from the filesystem
+    // by compaction while we are waiting for the lock.
+    auto deletion_guard = co_await get_sstable_list_permit();
+    co_await sg.make_sstable_set()->for_each_sstable_gently([&] (const sstables::shared_sstable& sst) -> future<> {
         ret.push_back(co_await sst->clone(calculate_generation_for_new_table()));
     });
     co_return ret;
@@ -1529,6 +1549,7 @@ table::seal_active_memtable(compaction_group& cg, flush_permit&& flush_permit) n
         });
 
         cg.memtables()->add_memtable();
+        _highest_flushed_rp = std::max(_highest_flushed_rp, old->replay_position());
 
         // no exceptions allowed (nor expected) from this point on
         _stats.memtable_switch_count++;
@@ -1656,6 +1677,17 @@ table::try_flush_memtable_to_sstable(compaction_group& cg, lw_shared_ptr<memtabl
                 co_await with_scheduling_group(_config.memtable_to_cache_scheduling_group, [this, old, &newtabs, &cg] {
                     return update_cache(cg, old, newtabs);
                 });
+
+                co_await utils::get_local_injector().inject("replica_post_flush_after_update_cache", [this] (auto& handler) -> future<> {
+                    const auto this_table_name = format("{}.{}", _schema->ks_name(), _schema->cf_name());
+                    if (this_table_name == handler.get("table_name")) {
+                        tlogger.info("error injection handler replica_post_flush_after_update_cache: suspending flush for table {}", this_table_name);
+                        handler.set("suspended", true);
+                        co_await handler.wait_for_message(std::chrono::steady_clock::now() + std::chrono::minutes{5});
+                        tlogger.info("error injection handler replica_post_flush_after_update_cache: resuming flush for table {}", this_table_name);
+                    }
+                });
+
                 cg.memtables()->erase(old);
                 tlogger.debug("Memtable for {}.{} replaced, into {} sstables", old->schema()->ks_name(), old->schema()->cf_name(), newtabs.size());
                 co_return;
@@ -1864,6 +1896,8 @@ table::sstable_list_builder::build_new_list(const sstables::sstable_set& current
                               const std::vector<sstables::shared_sstable>& old_sstables) {
     std::unordered_set<sstables::shared_sstable> s(old_sstables.begin(), old_sstables.end());
 
+    co_await utils::get_local_injector().inject("sstable_list_builder_delay", std::chrono::milliseconds(100));
+
     // add sstables from the current list into the new list except the ones that are in the old list
     std::vector<sstables::shared_sstable> removed_sstables;
     co_await current_sstables.for_each_sstable_gently([&s, &removed_sstables, &new_sstable_list] (const sstables::shared_sstable& tab) {
@@ -1922,13 +1956,12 @@ std::vector<sstables::shared_sstable> compaction_group::all_sstables() const {
 
 future<>
 compaction_group::merge_sstables_from(compaction_group& group) {
-    auto& cs = _t.get_compaction_strategy();
     auto permit = co_await _t.get_sstable_list_permit();
     table::sstable_list_builder builder(_t, std::move(permit));
 
     auto sstables_to_merge = group.all_sstables();
     // re-build new list for this group with sstables of the group being merged.
-    auto res = co_await builder.build_new_list(*main_sstables(), cs.make_sstable_set(_t.schema()), sstables_to_merge, {});
+    auto res = co_await builder.build_new_list(*main_sstables(), make_main_sstable_set(), sstables_to_merge, {});
     // execute:
     std::invoke([&] noexcept {
         set_main_sstables(std::move(res.new_sstable_set));
@@ -2010,7 +2043,7 @@ compaction_group::update_sstable_sets_on_compaction_completion(sstables::compact
             // The group that triggered compaction is the only one to have sstables removed from it.
             _cg_desc[&_cg].desc.old_sstables = _desc.old_sstables;
             for (auto& [cg, d] : _cg_desc) {
-                d.main_sstable_set_builder_result = co_await _builder.build_new_list(*cg->main_sstables(), _t._compaction_strategy.make_sstable_set(_t._schema),
+                d.main_sstable_set_builder_result = co_await _builder.build_new_list(*cg->main_sstables(), cg->make_main_sstable_set(),
                                                                   d.desc.new_sstables, d.desc.old_sstables);
 
                 if (!d.desc.old_sstables.empty()
@@ -2021,7 +2054,7 @@ compaction_group::update_sstable_sets_on_compaction_completion(sstables::compact
                     // sstables from the maintenance set. No need to add any new sstables to the maintenance
                     // set though, as they are always added to the main set.
                     auto builder_result = co_await _builder.build_new_list(
-                            *cg->maintenance_sstables(), std::move(*_t.make_maintenance_sstable_set()), {}, d.desc.old_sstables);
+                            *cg->maintenance_sstables(), std::move(*cg->make_maintenance_sstable_set()), {}, d.desc.old_sstables);
                     d.new_maintenance_sstables = std::move(builder_result.new_sstable_set);
                 }
             }
@@ -2151,14 +2184,13 @@ void table::set_compaction_strategy(sstables::compaction_strategy_type strategy)
     tlogger.debug("Setting compaction strategy of {}.{} to {}", _schema->ks_name(), _schema->cf_name(), sstables::compaction_strategy::name(strategy));
     auto new_cs = make_compaction_strategy(strategy, _schema->compaction_strategy_options());
 
-    struct compaction_group_sstable_set_updater {
+    struct compaction_group_strategy_updater {
         table& t;
         compaction_group& cg;
         compaction_backlog_tracker new_bt;
         compaction::compaction_strategy_state new_cs_state;
-        lw_shared_ptr<sstables::sstable_set> new_sstables;
 
-        compaction_group_sstable_set_updater(table& t, compaction_group& cg, sstables::compaction_strategy& new_cs)
+        compaction_group_strategy_updater(table& t, compaction_group& cg, sstables::compaction_strategy& new_cs)
             : t(t)
             , cg(cg)
             , new_bt(new_cs.make_backlog_tracker())
@@ -2169,26 +2201,26 @@ void table::set_compaction_strategy(sstables::compaction_strategy_type strategy)
             auto move_read_charges = new_cs.type() == t._compaction_strategy.type();
             cg.get_backlog_tracker().copy_ongoing_charges(new_bt, move_read_charges);
 
-            new_sstables = make_lw_shared<sstables::sstable_set>(new_cs.make_sstable_set(t._schema));
             std::vector<sstables::shared_sstable> new_sstables_for_backlog_tracker;
             new_sstables_for_backlog_tracker.reserve(cg.main_sstables()->size());
-            cg.main_sstables()->for_each_sstable([this, &new_sstables_for_backlog_tracker] (const sstables::shared_sstable& s) {
-                new_sstables->insert(s);
+            cg.main_sstables()->for_each_sstable([&new_sstables_for_backlog_tracker] (const sstables::shared_sstable& s) {
                 new_sstables_for_backlog_tracker.push_back(s);
             });
             new_bt.replace_sstables({}, std::move(new_sstables_for_backlog_tracker));
         }
 
         void execute() noexcept {
+            // Update strategy state and backlog tracker according to new strategy. SSTable set update
+            // is delayed until new compaction, which is triggered on strategy change. SSTable set
+            // cannot be updated here since it must happen under the set update lock.
             t._compaction_manager.register_backlog_tracker(cg.as_table_state(), std::move(new_bt));
-            cg.set_main_sstables(std::move(new_sstables));
             cg.set_compaction_strategy_state(std::move(new_cs_state));
         }
     };
-    std::vector<compaction_group_sstable_set_updater> cg_sstable_set_updaters;
+    std::vector<compaction_group_strategy_updater> cg_sstable_set_updaters;
 
     for_each_compaction_group([&] (compaction_group& cg) {
-        compaction_group_sstable_set_updater updater(*this, cg, new_cs);
+        compaction_group_strategy_updater updater(*this, cg, new_cs);
         updater.prepare(new_cs);
         cg_sstable_set_updaters.push_back(std::move(updater));
     });
@@ -2197,7 +2229,6 @@ void table::set_compaction_strategy(sstables::compaction_strategy_type strategy)
     for (auto& updater : cg_sstable_set_updaters) {
         updater.execute();
     }
-    refresh_compound_sstable_set();
 }
 
 size_t table::sstables_count() const {
@@ -2306,6 +2337,10 @@ class compaction_group::table_state : public compaction::table_state {
 public:
     explicit table_state(table& t, compaction_group& cg) : _t(t), _cg(cg) {}
 
+    dht::token_range token_range() const noexcept override {
+        return _cg.token_range();
+    }
+
     const schema_ptr& schema() const noexcept override {
         return _t.schema();
     }
@@ -2408,8 +2443,9 @@ compaction_group::compaction_group(table& t, size_t group_id, dht::token_range t
     , _token_range(std::move(token_range))
     , _compaction_strategy_state(compaction::compaction_strategy_state::make(_t._compaction_strategy))
     , _memtables(_t._config.enable_disk_writes ? _t.make_memtable_list(*this) : _t.make_memory_only_memtable_list())
-    , _main_sstables(make_lw_shared<sstables::sstable_set>(t._compaction_strategy.make_sstable_set(t.schema())))
-    , _maintenance_sstables(t.make_maintenance_sstable_set())
+    , _main_sstables(make_lw_shared<sstables::sstable_set>(make_main_sstable_set()))
+    , _maintenance_sstables(make_maintenance_sstable_set())
+    , _async_gate(format("[compaction_group {}.{} {}]", t.schema()->ks_name(), t.schema()->cf_name(), group_id))
 {
     _t._compaction_manager.add(as_table_state());
 }
@@ -2442,8 +2478,8 @@ bool compaction_group::empty() const noexcept {
 }
 
 void compaction_group::clear_sstables() {
-    _main_sstables = make_lw_shared<sstables::sstable_set>(_t._compaction_strategy.make_sstable_set(_t._schema));
-    _maintenance_sstables = _t.make_maintenance_sstable_set();
+    _main_sstables = make_lw_shared<sstables::sstable_set>(make_main_sstable_set());
+    _maintenance_sstables = make_maintenance_sstable_set();
 }
 
 void storage_group::clear_sstables() {
@@ -2467,13 +2503,20 @@ table::table(schema_ptr schema, config config, lw_shared_ptr<const storage_optio
     , _compaction_strategy(make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
     , _sg_manager(make_storage_group_manager())
     , _sstables(make_compound_sstable_set())
+    , _sstable_deletion_gate(format("[table {}.{}] sstable_deletion_gate", _schema->ks_name(), _schema->cf_name()))
     , _cache(_schema, sstables_as_snapshot_source(), row_cache_tracker, is_continuous::yes)
     , _commitlog(nullptr)
     , _readonly(true)
     , _durable_writes(true)
     , _sstables_manager(sst_manager)
     , _index_manager(this->as_data_dictionary())
+    , _flush_barrier(format("[table {}.{}] flush_barrier", _schema->ks_name(), _schema->cf_name()))
     , _counter_cell_locks(_schema->is_counter() ? std::make_unique<cell_locker>(_schema, cl_stats) : nullptr)
+    , _async_gate(format("[table {}.{}] async_gate", _schema->ks_name(), _schema->cf_name()))
+    , _pending_writes_phaser(format("[table {}.{}] pending_writes", _schema->ks_name(), _schema->cf_name()))
+    , _pending_reads_phaser(format("[table {}.{}] pending_reads", _schema->ks_name(), _schema->cf_name()))
+    , _pending_streams_phaser(format("[table {}.{}] pending_streams", _schema->ks_name(), _schema->cf_name()))
+    , _pending_flushes_phaser(format("[table {}.{}] pending_flushes", _schema->ks_name(), _schema->cf_name()))
     , _row_locker(_schema)
     , _flush_timer([this]{ on_flush_timer(); })
     , _off_strategy_trigger([this] { trigger_offstrategy_compaction(); })
@@ -2578,6 +2621,8 @@ future<> tablet_storage_group_manager::merge_completion_fiber() {
 
     while (!_t.async_gate().is_closed()) {
         try {
+            co_await utils::get_local_injector().inject("merge_completion_fiber", utils::wait_for_message(60s));
+
             co_await for_each_storage_group_gently([] (storage_group& sg) -> future<> {
                 auto main_group = sg.main_compaction_group();
                 for (auto& group : sg.merging_groups()) {
@@ -2762,20 +2807,7 @@ max_purgeable_fn table::get_max_purgeable_fn_for_cache_underlying_reader() const
         auto max_purgeable_timestamp = api::max_timestamp;
 
         sg.for_each_compaction_group([&dk, is_shadowable, &max_purgeable_timestamp] (const compaction_group_ptr& cg) {
-            const auto& mt = cg->memtables()->active_memtable();
-            // see get_max_purgeable_timestamp() in compaction.cc for comments on choosing min timestamp
-            api::timestamp_type memtable_min_timestamp = is_shadowable ? mt.get_min_live_row_marker_timestamp() : mt.get_min_live_timestamp();
-            if (memtable_min_timestamp > cg->max_seen_timestamp()) {
-                // All the entries in the memtable are newer than the entries in the
-                // SSTable within this compaction group. So, no need to check further.
-                return;
-            }
-
-            // If a memtable with a minimum timestamp lower than the current maximum
-            // purgeable timestamp has the given key, the tombstone should not be purged.
-            if (memtable_min_timestamp < max_purgeable_timestamp && mt.contains_partition(dk)) {
-                max_purgeable_timestamp = memtable_min_timestamp;
-            }
+            max_purgeable_timestamp = std::min(cg->memtables()->min_live_timestamp(dk, is_shadowable, cg->max_seen_timestamp()), max_purgeable_timestamp);
         });
 
         return max_purgeable_timestamp;
@@ -2821,6 +2853,9 @@ logalloc::occupancy_stats table::occupancy() const {
     return res;
 }
 
+db::replay_position table::highest_flushed_replay_position() const {
+    return _highest_flushed_rp;
+}
 
 future<>
 table::seal_snapshot(sstring jsondir, std::vector<snapshot_file_set> file_sets) {
@@ -3159,8 +3194,8 @@ future<db::replay_position> table::discard_sstables(db_clock::time_point truncat
         for_each_compaction_group([&] (compaction_group& cg) {
             auto gc_trunc = to_gc_clock(truncated_at);
 
-            auto pruned = make_lw_shared<sstables::sstable_set>(_compaction_strategy.make_sstable_set(_schema));
-            auto maintenance_pruned = make_maintenance_sstable_set();
+            auto pruned = make_lw_shared<sstables::sstable_set>(cg.make_main_sstable_set());
+            auto maintenance_pruned = cg.make_maintenance_sstable_set();
 
             auto prune = [&] (lw_shared_ptr<sstables::sstable_set>& pruned,
                                             const lw_shared_ptr<sstables::sstable_set>& pruning,
@@ -3238,14 +3273,9 @@ void table::set_schema(schema_ptr s) {
     _schema = std::move(s);
 
     for (auto&& v : _views) {
-        auto base_info = v->view_info()->make_base_dependent_view_info(*_schema);
-        v->view_info()->set_base_info(base_info);
-        if (v->registry_entry()) {
-            v->registry_entry()->update_base_schema(_schema);
-        }
+        v->view_info()->reset_view_info();
         if (auto reverse_schema = local_schema_registry().get_or_null(reversed(v->version()))) {
-            reverse_schema->view_info()->set_base_info(base_info);
-            reverse_schema->registry_entry()->update_base_schema(_schema);
+            reverse_schema->view_info()->reset_view_info();
         }
     }
 
@@ -3439,10 +3469,6 @@ db::replay_position table::set_low_replay_position_mark() {
 
 template<typename... Args>
 void table::do_apply(compaction_group& cg, db::rp_handle&& h, Args&&... args) {
-    if (cg.async_gate().is_closed()) [[unlikely]] {
-        on_internal_error(tlogger, "async_gate of table's compaction group is closed");
-    }
-
     utils::latency_counter lc;
     _stats.writes.set_latency(lc);
     db::replay_position rp = h;
@@ -3806,7 +3832,7 @@ future<row_locker::lock_holder> table::do_push_view_replica_updates(shared_ptr<d
         co_return row_locker::lock_holder();
     }
 
-    auto views = db::view::with_base_info_snapshot(affected_views(gen, base, m));
+    auto views = affected_views(gen, base, m);
     if (views.empty()) {
         co_return row_locker::lock_holder();
     }
@@ -3972,7 +3998,7 @@ future<> compaction_group::cleanup() {
         const lw_shared_ptr<sstables::sstable_set> _empty_maintenance_set;
     private:
         lw_shared_ptr<sstables::sstable_set> empty_sstable_set() const {
-            return make_lw_shared<sstables::sstable_set>(_t._compaction_strategy.make_sstable_set(_t._schema));
+            return make_lw_shared<sstables::sstable_set>(_cg.make_main_sstable_set());
         }
     public:
         explicit compaction_group_cleaner(compaction_group& cg)

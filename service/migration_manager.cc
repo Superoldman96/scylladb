@@ -65,6 +65,7 @@ migration_manager::migration_manager(migration_notifier& notifier, gms::feature_
                 });
             })
         )
+        , _background_tasks("migration_manager::background_tasks")
         , _feat(feat), _messaging(ms), _storage_proxy(storage_proxy), _gossiper(gossiper), _group0_client(group0_client)
         , _sys_ks(sysks)
         , _schema_push([this] { return passive_announce(); })
@@ -237,7 +238,8 @@ bool migration_manager::have_schema_agreement() {
     auto our_version = _storage_proxy.get_db().local().get_version();
     bool match = false;
     static thread_local logger::rate_limit rate_limit{std::chrono::seconds{5}};
-    _gossiper.for_each_endpoint_state_until([&, my_address = _messaging.broadcast_address()] (const gms::inet_address& endpoint, const gms::endpoint_state& eps) {
+    _gossiper.for_each_endpoint_state_until([&, my_address = _gossiper.my_host_id()] (const gms::endpoint_state& eps) {
+        auto endpoint = eps.get_host_id();
         if (endpoint == my_address || !_gossiper.is_alive(eps.get_host_id())) {
             return stop_iteration::no;
         }
@@ -918,7 +920,7 @@ future<> migration_manager::announce_with_raft(std::vector<mutation> schema, gro
         },
         guard, std::move(description));
 
-    return _group0_client.add_entry(std::move(group0_cmd), std::move(guard), _as);
+    return _group0_client.add_entry(std::move(group0_cmd), std::move(guard), _as, raft_timeout{});
 }
 
 future<> migration_manager::announce_without_raft(std::vector<mutation> schema, group0_guard guard) {
@@ -1068,9 +1070,9 @@ static future<schema_ptr> get_schema_definition(table_schema_version v, locator:
                 base_schema = db.find_schema(us->view_info()->base_id());
                 db::schema_tables::check_no_legacy_secondary_index_mv_schema(db, view_ptr(us), base_schema);
             }
-            return db::schema_tables::store_column_mapping(proxy, us, true).then([us, base_schema] -> base_and_view_schemas {
+            return db::schema_tables::store_column_mapping(proxy, us, true).then([us, base_schema] -> view_schema_and_base_info {
                 if (us->is_view()) {
-                    return {frozen_schema(us), base_schema};
+                    return {frozen_schema(us), us->view_info()->base_info()};
                 } else {
                     return {frozen_schema(us)};
                 }

@@ -16,7 +16,7 @@
 #include "types/tuple.hh"
 #include "dht/i_partitioner.hh"
 #include "reader_concurrency_semaphore.hh"
-#include "readers/from_mutations_v2.hh"
+#include "readers/from_mutations.hh"
 
 logging::logger mlog("mutation");
 
@@ -283,7 +283,7 @@ future<> split_mutation(mutation source, std::vector<mutation>& target, size_t m
         reader_concurrency_semaphore::register_metrics::no);
     {
         auto s = source.schema();
-        auto reader = make_mutation_reader_from_mutations_v2(s,
+        auto reader = make_mutation_reader_from_mutations(s,
             sem.make_tracking_only_permit(s, "split_mutation", db::no_timeout, {}),
             std::move(source));
         co_await with_closeable(std::move(reader), [&] (mutation_reader& reader) {
@@ -360,7 +360,13 @@ void mutation_partition_json_writer::write_atomic_cell_value(const atomic_cell_v
 }
 
 void mutation_partition_json_writer::write_collection_value(const collection_mutation_view_description& mv, data_type type) {
-    write_each_collection_cell(mv, type, [&] (atomic_cell_view v, data_type t) { write_atomic_cell_value(v, t); });
+    write_each_collection_cell(mv, type, [&] (atomic_cell_view v, data_type t) {
+        if (v.is_live()) {
+            write_atomic_cell_value(v, t);
+        } else {
+            writer().Null();
+        }
+    });
 }
 
 void mutation_partition_json_writer::write(gc_clock::duration ttl, gc_clock::time_point expiry) {

@@ -22,8 +22,8 @@ public:
             : memtable_filling_virtual_table(s)
             , _mutations(std::move(mutations)) {}
 
-    future<> execute(std::function<void(mutation)> mutation_sink) override {
-        return with_timeout(db::no_timeout, do_for_each(_mutations, [mutation_sink = std::move(mutation_sink)] (const mutation& m) { mutation_sink(m); }));
+    future<> execute(std::function<void(mutation)> mutation_sink, reader_permit permit) override {
+        return with_timeout(permit.timeout(), do_for_each(_mutations, [mutation_sink = std::move(mutation_sink)] (const mutation& m) { mutation_sink(m); }));
     }
 };
 
@@ -39,7 +39,7 @@ public:
     virtual future<> execute(reader_permit permit, db::result_collector& rc) override {
         return async([this, permit, &rc] {
             auto mt = make_memtable(_s, _mutations);
-            auto rdr = mt->make_flat_reader(_s, permit);
+            auto rdr = mt->make_mutation_reader(_s, permit);
             auto close_rdr = deferred_close(rdr);
             rdr.consume_pausable([&rc] (mutation_fragment_v2 mf) {
                 return rc.take(std::move(mf)).then([] { return stop_iteration::no; });

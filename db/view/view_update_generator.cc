@@ -19,7 +19,7 @@
 #include "readers/evictable.hh"
 #include "dht/partition_filter.hh"
 #include "utils/pretty_printers.hh"
-#include "readers/from_mutations_v2.hh"
+#include "readers/from_mutations.hh"
 #include "service/storage_proxy.hh"
 #include "db/config.hh"
 
@@ -141,7 +141,11 @@ future<> view_update_generator::start() {
                     // Exploit the fact that sstables in the staging directory
                     // are usually non-overlapping and use a partitioned set for
                     // the read.
-                    auto ssts = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s, false));
+                    // With tablets, it doesn't matter full range is fed into partitioned set since
+                    // there will be usually one sstable to be processed per tablet, and sstables of
+                    // different tablets are disjoint.
+                    auto token_range = dht::token_range::make(dht::first_token(), dht::last_token());
+                    auto ssts = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s, std::move(token_range)));
                     for (auto& sst : sstables) {
                         ssts->insert(sst);
                         input_size += sst->data_size();
@@ -329,7 +333,7 @@ static size_t memory_usage_of(const utils::chunked_vector<frozen_mutation_and_sc
  * @return a future that resolves when the updates have been acknowledged by the view replicas
  */
 future<> view_update_generator::populate_views(const replica::table& table,
-        std::vector<view_and_base> views,
+        std::vector<view_ptr> views,
         dht::token base_token,
         mutation_reader&& reader,
         gc_clock::time_point now) {
@@ -402,7 +406,7 @@ struct view_update_generation_timeout_exception : public seastar::timed_out_erro
 future<> view_update_generator::generate_and_propagate_view_updates(const replica::table& table,
         const schema_ptr& base,
         reader_permit permit,
-        std::vector<view_and_base>&& views,
+        std::vector<view_ptr>&& views,
         mutation&& m,
         mutation_reader_opt existings,
         tracing::trace_state_ptr tr_state,
@@ -415,7 +419,7 @@ future<> view_update_generator::generate_and_propagate_view_updates(const replic
             table,
             base,
             std::move(views),
-            make_mutation_reader_from_mutations_v2(std::move(m_schema), std::move(permit), std::move(m)),
+            make_mutation_reader_from_mutations(std::move(m_schema), std::move(permit), std::move(m)),
             std::move(existings),
             now);
 

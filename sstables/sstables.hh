@@ -238,13 +238,12 @@ public:
     // load sstable using components shared by a shard
     future<> load(foreign_sstable_open_info info) noexcept;
     // Load metadata components from disk
-    future<> load_metadata(sstable_open_config cfg = {}, bool validate = true) noexcept;
+    future<> load_metadata(sstable_open_config cfg = {}) noexcept;
     // load all components from disk
     // this variant will be useful for testing purposes and also when loading
     // a new sstable from scratch for sharing its components.
     future<> load(const dht::sharder& sharder, sstable_open_config cfg = {}) noexcept;
     future<> open_data(sstable_open_config cfg = {}) noexcept;
-    future<> update_info_for_opened_data(sstable_open_config cfg = {});
 
     // Load set of shards that own the SSTable, while reading the minimum
     // from disk to achieve that.
@@ -561,6 +560,7 @@ private:
     schema_ptr _schema;
     generation_type _generation{0};
     sstable_state _state;
+    sstable_enabled_features _features = {};
 
     std::unique_ptr<storage> _storage;
 
@@ -651,7 +651,6 @@ private:
     future<> read_scylla_metadata() noexcept;
 
     void write_scylla_metadata(shard_id shard,
-                               sstable_enabled_features features,
                                run_identifier identifier,
                                std::optional<scylla_metadata::large_data_stats> ld_stats,
                                std::optional<scylla_metadata::ext_timestamp_stats> ts_stats);
@@ -665,6 +664,9 @@ private:
     // This should be called only before an sstable is sealed.
     void maybe_rebuild_filter_from_index(uint64_t num_partitions);
 
+    future<> update_info_for_opened_data(sstable_open_config cfg = {});
+
+    future<> read_toc() noexcept;
     future<> read_summary() noexcept;
 
     void write_summary() {
@@ -784,7 +786,6 @@ private:
     // runs in async context (called from storage::open)
     void write_toc(file_writer w);
 public:
-    future<> read_toc() noexcept;
 
     shareable_components& get_shared_components() const {
         return *_components;
@@ -809,22 +810,27 @@ public:
     void validate_originating_host_id() const;
 
     bool has_correct_promoted_index_entries() const {
-        return _schema->is_compound() || !has_scylla_component() || _components->scylla_metadata->has_feature(sstable_feature::NonCompoundPIEntries);
+        return _schema->is_compound() || !has_scylla_component() || has_feature(sstable_feature::NonCompoundPIEntries);
     }
 
     bool has_correct_non_compound_range_tombstones() const {
-        return _schema->is_compound() || !has_scylla_component() || _components->scylla_metadata->has_feature(sstable_feature::NonCompoundRangeTombstones);
+        return _schema->is_compound() || !has_scylla_component() || has_feature(sstable_feature::NonCompoundRangeTombstones);
     }
 
     bool has_shadowable_tombstones() const {
-        return has_scylla_component() && _components->scylla_metadata->has_feature(sstable_feature::ShadowableTombstones);
+        return has_feature(sstable_feature::ShadowableTombstones);
     }
 
     sstable_enabled_features features() const {
-        if (!has_scylla_component()) {
-            return {};
-        }
-        return _components->scylla_metadata->get_features();
+        return _features;
+    }
+
+    void set_features(sstable_enabled_features sef) {
+        _features = sef;
+    }
+
+    bool has_feature(sstable_feature f) const {
+        return features().is_enabled(f);
     }
 
     const scylla_metadata* get_scylla_metadata() const {
@@ -1107,7 +1113,12 @@ future<> init_metrics();
 class file_io_extension {
 public:
     virtual ~file_io_extension() {}
-    virtual future<file> wrap_file(sstable&, component_type, file, open_flags flags) = 0;
+    virtual future<file> wrap_file(const sstable&, component_type, file, open_flags flags) = 0;
+
+    // same intent as wrap_file, but a data_sink, i.e. write-only, simplified
+    // output device. Default impl will call wrap_file and generate a wrapper object.
+    virtual future<data_sink> wrap_sink(const sstable&, component_type, data_sink);
+
     // optionally return a map of attributes for a given sstable,
     // suitable for "describe".
     // This would preferably be interesting info on what/why the extension did

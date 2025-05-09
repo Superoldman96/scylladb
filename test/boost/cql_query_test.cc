@@ -1975,11 +1975,11 @@ SEASTAR_TEST_CASE(test_table_compression) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
         e.execute_cql("create table tb1 (foo text PRIMARY KEY, bar text) with compression = { };").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb1"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb1")->get_compressor_params().get_compressor() == nullptr);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb1")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::none);
 
         e.execute_cql("create table tb5 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : '' };").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb5"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb5")->get_compressor_params().get_compressor() == nullptr);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb5")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::none);
 
         BOOST_REQUIRE_THROW(e.execute_cql(
                 "create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LossyCompressor' };").get(),
@@ -1993,20 +1993,20 @@ SEASTAR_TEST_CASE(test_table_compression) {
 
         e.execute_cql("create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LZ4Compressor', 'chunk_length_kb' : 2 };").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb2"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb2")->get_compressor_params().get_compressor() == compressor::lz4);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb2")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::lz4);
         BOOST_REQUIRE(e.local_db().find_schema("ks", "tb2")->get_compressor_params().chunk_length() == 2 * 1024);
 
         e.execute_cql("create table tb3 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'DeflateCompressor' };").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb3"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb3")->get_compressor_params().get_compressor() == compressor::deflate);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb3")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::deflate);
 
         e.execute_cql("create table tb4 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'org.apache.cassandra.io.compress.DeflateCompressor' };").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb4"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb4")->get_compressor_params().get_compressor() == compressor::deflate);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb4")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::deflate);
 
         e.execute_cql("create table tb6 (foo text PRIMARY KEY, bar text);").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb6"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb6")->get_compressor_params().get_compressor() == compressor::lz4);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb6")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::lz4);
     });
 }
 
@@ -4130,7 +4130,7 @@ SEASTAR_TEST_CASE(test_view_with_two_regular_base_columns_in_key) {
                 .with_column(to_bytes("v2"), int32_type, column_kind::clustering_key)
                 .with_column(to_bytes("p"), int32_type, column_kind::clustering_key)
                 .with_column(to_bytes("c"), int32_type, column_kind::clustering_key)
-                .with_view_info(*schema, false, "v1 IS NOT NULL AND v2 IS NOT NULL AND p IS NOT NULL AND c IS NOT NULL");
+                .with_view_info(schema, false, "v1 IS NOT NULL AND v2 IS NOT NULL AND p IS NOT NULL AND c IS NOT NULL");
 
         schema_ptr view_schema = view_builder.build();
         auto& mm = e.migration_manager().local();
@@ -5892,7 +5892,7 @@ SEASTAR_TEST_CASE(test_setting_synchronous_updates_property) {
 static
 cql_test_config tablet_cql_test_config() {
     cql_test_config c;
-    c.db_config->enable_tablets.set(true);
+    c.db_config->tablets_mode_for_new_keyspaces.set(db::tablets_mode_t::mode::enabled);
     return c;
 }
 

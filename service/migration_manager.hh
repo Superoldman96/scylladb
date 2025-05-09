@@ -12,13 +12,11 @@
 
 #include "service/migration_listener.hh"
 #include "gms/endpoint_state.hh"
-#include <seastar/core/distributed.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/gate.hh>
 #include "gms/inet_address.hh"
 #include "gms/feature.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
-#include "message/msg_addr.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/serialized_action.hh"
 #include "service/raft/raft_group_registry.hh"
@@ -59,7 +57,7 @@ private:
     std::unordered_map<locator::host_id, serialized_action> _schema_pulls;
     serialized_action _group0_barrier;
     std::vector<gms::feature::listener_registration> _feature_listeners;
-    seastar::gate _background_tasks;
+    seastar::named_gate _background_tasks;
     static const std::chrono::milliseconds migration_delay;
     gms::feature_service& _feat;
     netw::messaging_service& _messaging;

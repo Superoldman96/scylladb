@@ -114,6 +114,7 @@
 #include "utils/advanced_rpc_compressor.hh"
 #include "utils/shared_dict.hh"
 #include "message/dictionary_service.hh"
+#include "sstable_dict_autotrainer.hh"
 #include "utils/disk_space_monitor.hh"
 #include "utils/labels.hh"
 #include "tools/utils.hh"
@@ -172,8 +173,8 @@ public:
         _broadcasts_to_abort_sources_done.get();
         _abort_sources.stop().get();
     }
-    void ready() {
-        _ready = true;
+    void ready(bool state = true) {
+        _ready = state;
         check();
     }
     void check() {
@@ -211,7 +212,6 @@ read_config(bpo::variables_map& opts, db::config& cfg) {
             }
             startlog.log(level, "{} : {}", msg, opt);
         });
-        co_await read_object_storage_config(cfg);
     } catch (...) {
         auto ep = std::current_exception();
         startlog.error("Could not read configuration file {}: {}", file, ep);
@@ -578,6 +578,17 @@ static locator::host_id initialize_local_info_thread(sharded<db::system_keyspace
     } else if (linfo.cluster_name != cfg.cluster_name()) {
         throw exceptions::configuration_exception("Saved cluster name " + linfo.cluster_name + " != configured name " + cfg.cluster_name());
     }
+    const auto location = snitch.local()->get_location();
+    if (linfo.dc.empty()) {
+        linfo.dc = location.dc;
+    } else if (linfo.dc != location.dc) {
+        throw std::runtime_error(format("Saved DC name \"{}\" is not equal to the DC name \"{}\" specified by the snitch", linfo.dc, location.dc));
+    }
+    if (linfo.rack.empty()) {
+        linfo.rack = location.rack;
+    } else if (linfo.rack != location.rack) {
+        throw std::runtime_error(format("Saved rack name \"{}\" is not equal to the rack name \"{}\" specified by the snitch", linfo.rack, location.rack));
+    }
     if (!linfo.host_id) {
         linfo.host_id = locator::host_id::create_random_id();
         startlog.info("Setting local host id to {}", linfo.host_id);
@@ -585,7 +596,7 @@ static locator::host_id initialize_local_info_thread(sharded<db::system_keyspace
 
     linfo.listen_address = listen_address;
     const auto host_id = linfo.host_id;
-    sys_ks.local().save_local_info(std::move(linfo), snitch.local()->get_location(), broadcast_address, broadcast_rpc_address).get();
+    sys_ks.local().save_local_info(std::move(linfo), broadcast_address, broadcast_rpc_address).get();
     return host_id;
 }
 
@@ -685,7 +696,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
     // If --version is requested, print it out and exit immediately to avoid
     // Seastar-specific warnings that may occur when running the app
-    if (!isatty(fileno(stdin))) {
+    if (!isatty(fileno(stdin)) || tcgetpgrp(fileno(stdin)) != getpgrp()) {
         auto parsed_opts = bpo::command_line_parser(ac, av).options(app.get_options_description()).allow_unregistered().run();
         print_starting_message(ac, av, parsed_opts);
     }
@@ -1225,10 +1236,20 @@ sharded<locator::shared_token_metadata> token_metadata;
             auto stop_lang_man = defer_verbose_shutdown("lang manager", [] { langman.invoke_on_all(&lang::manager::stop).get(); });
             langman.invoke_on_all(&lang::manager::start).get();
 
+            sharded<default_sstable_compressor_factory> sstable_compressor_factory;
+            auto numa_groups = local_engine->smp().shard_to_numa_node_mapping();
+            sstable_compressor_factory.start(sharded_parameter(default_sstable_compressor_factory::config::from_db_config,
+                                                               std::cref(*cfg), std::cref(numa_groups))).get();
+            auto stop_compressor_factory = defer_verbose_shutdown("sstable_compressor_factory", [&sstable_compressor_factory] {
+                sstable_compressor_factory.stop().get();
+            });
+
             checkpoint(stop_signal, "starting database");
+
             debug::the_database = &db;
             db.start(std::ref(*cfg), dbcfg, std::ref(mm_notifier), std::ref(feature_service), std::ref(token_metadata),
-                    std::ref(cm), std::ref(sstm), std::ref(langman), std::ref(sst_dir_semaphore), std::ref(stop_signal.as_sharded_abort_source()), utils::cross_shard_barrier()).get();
+                    std::ref(cm), std::ref(sstm), std::ref(langman), std::ref(sst_dir_semaphore), std::ref(sstable_compressor_factory),
+                    std::ref(stop_signal.as_sharded_abort_source()), utils::cross_shard_barrier()).get();
             auto stop_database_and_sstables = defer_verbose_shutdown("database", [&db] {
                 // #293 - do not stop anything - not even db (for real)
                 //return db.stop();
@@ -1632,7 +1653,7 @@ sharded<locator::shared_token_metadata> token_metadata;
                     stop_signal.as_local_abort_source(), raft_gr.local(), messaging,
                     gossiper.local(), feature_service.local(), sys_ks.local(), group0_client, dbcfg.gossip_scheduling_group};
 
-            checkpoint(stop_signal, "starting talet allocator");
+            checkpoint(stop_signal, "starting tablet allocator");
             service::tablet_allocator::config tacfg;
             distributed<service::tablet_allocator> tablet_allocator;
             tablet_allocator.start(tacfg, std::ref(mm_notifier), std::ref(db)).get();
@@ -1645,6 +1666,24 @@ sharded<locator::shared_token_metadata> token_metadata;
             auto stop_mapreduce_service_handlers = defer_verbose_shutdown("mapreduce service", [&mapreduce_service] {
                 mapreduce_service.stop().get();
             });
+
+            class sstable_dict_deleter : public service::migration_listener::empty_listener {
+                service::migration_notifier& _mn;
+                gms::feature_service& _feat;
+            public:
+                sstable_dict_deleter(service::migration_notifier& mn, gms::feature_service& feat) : _mn(mn) , _feat(feat) {
+                    _mn.register_listener(this);
+                }
+                ~sstable_dict_deleter() {
+                    _mn.unregister_listener(this).get();
+                }
+                void on_before_drop_column_family(const schema& s, std::vector<mutation>& mutations, api::timestamp_type) override {
+                    if (_feat.sstable_compression_dicts) {
+                        mutations.push_back(db::system_keyspace::get_delete_dict_mutation(fmt::format("sstables/{}", s.id()), api::max_timestamp));
+                    }
+                }
+            };
+            auto the_sstable_dict_deleter = sstable_dict_deleter(mm_notifier.local(), feature_service.local());
 
             checkpoint(stop_signal, "starting migration manager");
             debug::the_migration_manager = &mm;
@@ -1675,9 +1714,15 @@ sharded<locator::shared_token_metadata> token_metadata;
             auto tablets_per_shard_goal_observer = cfg->tablets_per_shard_goal.observe(notify_topology);
             auto tablets_initial_scale_factor_observer = cfg->tablets_initial_scale_factor.observe(notify_topology);
 
-            auto compression_dict_updated_callback = [] () -> future<> {
-                auto dict = co_await sys_ks.local().query_dict();
-                co_await utils::announce_dict_to_shards(compressor_tracker, std::move(dict));
+            auto compression_dict_updated_callback = [&sstable_compressor_factory] (std::string_view name) -> future<> {
+                auto dict = co_await sys_ks.local().query_dict(name);
+                auto sstables_prefix = std::string_view("sstables/");
+                if (name.starts_with(sstables_prefix)) {
+                    auto table = table_id(utils::UUID(name.substr(sstables_prefix.size())));
+                    co_await sstable_compressor_factory.local().set_recommended_dict(table, std::move(dict.data));
+                } else if (name == dictionary_service::rpc_compression_dict_name) {
+                    co_await utils::announce_dict_to_shards(compressor_tracker, std::move(dict));
+                }
             };
 
             checkpoint(stop_signal, "starting system distributed keyspace");
@@ -1725,6 +1770,12 @@ sharded<locator::shared_token_metadata> token_metadata;
                 only_on_shard0(&*disk_space_monitor_shard0)
             ).get();
 
+            ss.local().set_train_dict_callback([&rpc_dict_training_worker] (std::vector<std::vector<std::byte>> sample) {
+                return rpc_dict_training_worker.submit<std::vector<std::byte>>([sample = std::move(sample)] {
+                    return utils::zdict_train(sample, {});
+                });
+            });
+
             auto stop_storage_service = defer_verbose_shutdown("storage_service", [&] {
                 ss.stop().get();
             });
@@ -1744,7 +1795,7 @@ sharded<locator::shared_token_metadata> token_metadata;
 
             checkpoint(stop_signal, "initializing virtual tables");
             smp::invoke_on_all([&] {
-                return db::initialize_virtual_tables(db, ss, gossiper, raft_gr, sys_ks, *cfg);
+                return db::initialize_virtual_tables(db, ss, gossiper, raft_gr, sys_ks, tablet_allocator, messaging, *cfg);
             }).get();
 
             // #293 - do not stop anything
@@ -2119,9 +2170,14 @@ sharded<locator::shared_token_metadata> token_metadata;
                     });
             }).get();
 
+            checkpoint(stop_signal, "join cluster");
+            // Allow abort during join_cluster since bootstrap or replace
+            // can take a long time.
+            stop_signal.ready(true);
             with_scheduling_group(maintenance_scheduling_group, [&] {
                 return ss.local().join_cluster(proxy, service::start_hint_manager::yes, generation_number);
             }).get();
+            stop_signal.ready(false);
 
             // At this point, `locator::topology` should be stable, i.e. we should have complete information
             // about the layout of the cluster (= list of nodes along with the racks/DCs).
@@ -2148,6 +2204,16 @@ sharded<locator::shared_token_metadata> token_metadata;
             );
             auto stop_dict_service = defer_verbose_shutdown("dictionary training", [&] {
                 dict_service.stop().get();
+            });
+
+            auto sst_dict_autotrainer = sstable_dict_autotrainer(ss.local(), group0_client, sstable_dict_autotrainer::config{
+                .tick_period_in_seconds = cfg->sstable_compression_dictionaries_autotrainer_tick_period_in_seconds,
+                .retrain_period_in_seconds = cfg->sstable_compression_dictionaries_retrain_period_in_seconds,
+                .min_dataset_bytes = cfg->sstable_compression_dictionaries_min_training_dataset_bytes,
+                .min_improvement_factor = cfg->sstable_compression_dictionaries_min_training_improvement_factor,
+            });
+            auto stop_sst_dict_autotrainer = defer_verbose_shutdown("sstable_dict_autotrainer", [&] {
+                sst_dict_autotrainer.stop().get();
             });
 
             checkpoint(stop_signal, "starting tracing");

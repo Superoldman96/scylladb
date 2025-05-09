@@ -291,7 +291,12 @@ private:
             auto& cdef = _underlying_schema->column_at(kind, id);
             writer.writer().Key(cdef.name_as_text());
             if (cdef.is_atomic()) {
-                writer.write_atomic_cell_value(cell.as_atomic_cell(cdef), cdef.type);
+                auto acv = cell.as_atomic_cell(cdef);
+                if (acv.is_live()) {
+                    writer.write_atomic_cell_value(acv, cdef.type);
+                } else {
+                    writer.writer().Null();
+                }
             } else if (cdef.type->is_collection() || cdef.type->is_user_type()) {
                 cell.as_collection_mutation().with_deserialized(*cdef.type, [&] (collection_mutation_view_description mv) {
                     writer.write_collection_value(mv, cdef.type);
@@ -415,7 +420,7 @@ future<mutation_reader> make_partition_mutation_dump_reader(
         auto& topo = erm->get_topology();
         const auto endpoints = erm->get_replicas_for_reading(dk.token());
         if (std::ranges::find(endpoints, topo.this_node()->host_id()) == endpoints.end()) {
-            co_return make_empty_flat_reader_v2(output_schema, std::move(permit));
+            co_return make_empty_mutation_reader(output_schema, std::move(permit));
         }
     }
 

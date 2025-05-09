@@ -21,14 +21,16 @@
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/simple_schema.hh"
 #include "test/lib/sstable_utils.hh"
-#include "readers/from_mutations_v2.hh"
+#include "readers/from_mutations.hh"
 
 BOOST_AUTO_TEST_SUITE(sstable_set_test)
 
 using namespace sstables;
 
-static sstables::sstable_set make_sstable_set(schema_ptr schema, lw_shared_ptr<sstable_list> all = {}, bool use_level_metadata = true) {
-    auto ret = sstables::sstable_set(std::make_unique<partitioned_sstable_set>(schema, use_level_metadata));
+static auto full_range = dht::token_range::make(dht::first_token(), dht::last_token());
+
+static sstables::sstable_set make_sstable_set(schema_ptr schema, lw_shared_ptr<sstable_list> all = {}) {
+    auto ret = sstables::sstable_set(std::make_unique<partitioned_sstable_set>(schema, full_range));
     for (auto& sst : *all) {
         ret.insert(sst);
     }
@@ -44,7 +46,7 @@ SEASTAR_TEST_CASE(test_sstables_sstable_set_read_modify_write) {
         auto mut = mutation(s, pk);
         ss.add_row(mut, ss.make_ckey(0), "val");
 
-        auto mr = make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
+        auto mr = make_mutation_reader_from_mutations(s, env.make_reader_permit(), mut);
         sstable_writer_config cfg = env.manager().configure_writer("");
         auto sst1 = make_sstable_easy(env, std::move(mr), cfg);
 
@@ -52,7 +54,7 @@ SEASTAR_TEST_CASE(test_sstables_sstable_set_read_modify_write) {
         BOOST_REQUIRE_EQUAL(ss1->all()->size(), 1);
 
         // Test that a random sstable_origin is stored and retrieved properly.
-        mr = make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
+        mr = make_mutation_reader_from_mutations(s, env.make_reader_permit(), mut);
         auto sst2 = make_sstable_easy(env, std::move(mr), cfg);
 
         auto ss2 = make_lw_shared<sstables::sstable_set>(*ss1);
@@ -72,7 +74,7 @@ SEASTAR_TEST_CASE(test_time_series_sstable_set_read_modify_write) {
         ss.add_row(mut, ss.make_ckey(0), "val");
         sstable_writer_config cfg = env.manager().configure_writer("");
 
-        auto mr = make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
+        auto mr = make_mutation_reader_from_mutations(s, env.make_reader_permit(), mut);
         auto sst1 = make_sstable_easy(env, std::move(mr), cfg);
 
         auto ss1 = make_lw_shared<time_series_sstable_set>(ss.schema(), true);
@@ -80,7 +82,7 @@ SEASTAR_TEST_CASE(test_time_series_sstable_set_read_modify_write) {
         BOOST_REQUIRE_EQUAL(ss1->all()->size(), 1);
 
         // Test that a random sstable_origin is stored and retrieved properly.
-        mr = make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
+        mr = make_mutation_reader_from_mutations(s, env.make_reader_permit(), mut);
         auto sst2 = make_sstable_easy(env, std::move(mr), cfg);
 
         auto ss2 = make_lw_shared<time_series_sstable_set>(*ss1);
@@ -118,7 +120,7 @@ SEASTAR_TEST_CASE(test_time_series_sstable_set_bytes_on_disk) {
         ss.add_row(mut, ss.make_ckey(0), "val");
         sstable_writer_config cfg = env.manager().configure_writer("");
 
-        auto mr = make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
+        auto mr = make_mutation_reader_from_mutations(s, env.make_reader_permit(), mut);
         auto sst1 = make_sstable_easy(env, std::move(mr), cfg);
         auto size1 = sst1->bytes_on_disk();
 
@@ -127,7 +129,7 @@ SEASTAR_TEST_CASE(test_time_series_sstable_set_bytes_on_disk) {
         BOOST_REQUIRE_EQUAL(ss1->bytes_on_disk(), size1);
 
         // Test that a random sstable_origin is stored and retrieved properly.
-        mr = make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
+        mr = make_mutation_reader_from_mutations(s, env.make_reader_permit(), mut);
         auto sst2 = make_sstable_easy(env, std::move(mr), cfg);
         auto size2 = sst2->bytes_on_disk();
 
@@ -152,16 +154,16 @@ SEASTAR_TEST_CASE(test_partitioned_sstable_set_bytes_on_disk) {
         ss.add_row(mut, ss.make_ckey(0), "val");
         sstable_writer_config cfg = env.manager().configure_writer("");
 
-        auto mr = make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
+        auto mr = make_mutation_reader_from_mutations(s, env.make_reader_permit(), mut);
         auto sst1 = make_sstable_easy(env, std::move(mr), cfg);
         auto size1 = sst1->bytes_on_disk();
 
-        auto ss1 = make_lw_shared<sstable_set>(std::make_unique<partitioned_sstable_set>(ss.schema(), true));
+        auto ss1 = make_lw_shared<sstable_set>(std::make_unique<partitioned_sstable_set>(ss.schema(), full_range));
         ss1->insert(sst1);
         BOOST_REQUIRE_EQUAL(ss1->bytes_on_disk(), size1);
 
         // Test that a random sstable_origin is stored and retrieved properly.
-        mr = make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
+        mr = make_mutation_reader_from_mutations(s, env.make_reader_permit(), mut);
         auto sst2 = make_sstable_easy(env, std::move(mr), cfg);
         auto size2 = sst2->bytes_on_disk();
 
@@ -179,7 +181,7 @@ SEASTAR_TEST_CASE(test_partitioned_sstable_set_bytes_on_disk) {
 SEASTAR_TEST_CASE(test_tablet_sstable_set_copy_ctor) {
     // enable tablets, to get access to tablet_storage_group_manager
     cql_test_config cfg;
-    cfg.db_config->enable_tablets(true);
+    cfg.db_config->tablets_mode_for_new_keyspaces(db::tablets_mode_t::mode::enabled);
 
     return do_with_cql_env_thread([&](cql_test_env& env) {
         env.execute_cql("CREATE KEYSPACE test_tablet_sstable_set_copy_ctor"

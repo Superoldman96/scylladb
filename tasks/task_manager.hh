@@ -280,7 +280,7 @@ public:
             impl& operator=(impl&&) = delete;
             virtual ~impl() = default;
         protected:
-            static future<std::vector<task_identity>> get_children(module_ptr module, task_id parent_id);
+            static future<std::vector<task_identity>> get_children(module_ptr module, task_id parent_id, std::function<bool(locator::host_id)> is_host_alive);
         public:
             virtual task_group get_group() const noexcept = 0;
             // Returns std::nullopt if an operation with task_id isn't tracked by this virtual_task.
@@ -318,7 +318,7 @@ public:
         task_manager& _tm;
         std::string _name;
         tasks_collection _tasks;
-        gate _gate;
+        named_gate _gate;
         uint64_t _sequence_number = 0;
     private:
         abort_source _as;
@@ -331,7 +331,7 @@ public:
         task_manager& get_task_manager() noexcept;
         const task_manager& get_task_manager() const noexcept;
         seastar::abort_source& abort_source() noexcept;
-        gate& async_gate() noexcept;
+        named_gate& async_gate() noexcept;
         const std::string& get_name() const noexcept;
         task_manager::task_map& get_local_tasks() noexcept;
         const task_manager::task_map& get_local_tasks() const noexcept;

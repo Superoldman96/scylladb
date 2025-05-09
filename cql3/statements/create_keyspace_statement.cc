@@ -113,10 +113,9 @@ future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector
         if (rs->uses_tablets()) {
             warnings.push_back(
                 "Tables in this keyspace will be replicated using Tablets "
-                "and will not support CDC, LWT and counters features. "
-                "To use CDC, LWT or counters, drop this keyspace and re-create it "
-                "without tablets by adding AND TABLETS = {'enabled': false} "
-                "to the CREATE KEYSPACE statement.");
+                "and will not support Materialized Views, Secondary Indexes, CDC, LWT and counters features. "
+                "To use Materialized Views, Secondary Indexes, CDC, LWT or counters, drop this keyspace and re-create it "
+                "without tablets by adding AND TABLETS = {'enabled': false} to the CREATE KEYSPACE statement.");
             if (ksm->initial_tablets().value()) {
                 warnings.push_back("Keyspace `initial` tablets option is deprecated.  Use per-table tablet options instead.");
             }
@@ -237,9 +236,6 @@ std::vector<sstring> check_against_restricted_replication_strategies(
     // We ignore errors (non-number, negative number, etc.) here,
     // these are checked and reported elsewhere.
     for (auto opt : attrs.get_replication_options()) {
-        if (opt.first == sstring("initial_tablets")) {
-            continue;
-        }
         try {
             auto rf = std::stol(opt.second);
             if (rf > 0) {

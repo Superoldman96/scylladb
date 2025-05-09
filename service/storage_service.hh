@@ -27,7 +27,6 @@
 #include <seastar/core/distributed.hh>
 #include <seastar/core/condition-variable.hh>
 #include "dht/token_range_endpoints.hh"
-#include <seastar/core/sleep.hh>
 #include "gms/application_state.hh"
 #include "gms/feature.hh"
 #include <seastar/core/semaphore.hh>
@@ -37,9 +36,7 @@
 #include <seastar/core/distributed.hh>
 #include "service/migration_listener.hh"
 #include <seastar/core/metrics_registration.hh>
-#include <seastar/core/rwlock.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/lowres_clock.hh>
 #include "cdc/generation_id.hh"
 #include "db/system_keyspace.hh"
 #include "raft/raft.hh"
@@ -183,7 +180,7 @@ private:
     std::vector<protocol_server*> _protocol_servers;
     std::vector<std::any> _listeners;
     gms::feature::listener_registration _workload_prioritization_registration;
-    gate _async_gate;
+    named_gate _async_gate;
 
     condition_variable _tablet_split_monitor_event;
     utils::sequenced_set<table_id> _tablet_split_candidates;
@@ -242,7 +239,7 @@ public:
         topology_state_machine& topology_state_machine,
         tasks::task_manager& tm,
         gms::gossip_address_map& address_map,
-        std::function<future<void>()> compression_dictionary_updated_callback,
+        std::function<future<void>(std::string_view)> compression_dictionary_updated_callback,
         utils::disk_space_monitor* disk_space_minitor);
     ~storage_service();
 
@@ -300,6 +297,7 @@ private:
     }
 
     friend struct ::node_ops_ctl;
+    friend void check_raft_rpc_scheduling_group(storage_service&, std::string_view);
 public:
 
     const gms::gossiper& gossiper() const noexcept {
@@ -325,6 +323,24 @@ public:
     const locator::token_metadata& get_token_metadata() const noexcept {
         return *_shared_token_metadata.get();
     }
+
+    abort_source& get_abort_source() noexcept {
+        return _abort_source;
+    }
+
+    gms::feature_service& get_feature_service() noexcept {
+        return _feature_service;
+    }
+
+    replica::database& get_database() noexcept {
+        return _db.local();
+    }
+
+    db::system_keyspace& get_system_keyspace() noexcept {
+        return _sys_ks.local();
+    }
+
+    bool is_raft_leader() const noexcept;
 
 private:
     inet_address get_broadcast_address() const noexcept {
@@ -381,7 +397,7 @@ private:
         std::unordered_map<locator::host_id, gms::loaded_endpoint_state> ignore_nodes;
     };
     future<replacement_info> prepare_replacement_info(std::unordered_set<gms::inet_address> initial_contact_nodes,
-            const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features);
+            const std::unordered_map<locator::host_id, sstring>& loaded_peer_features);
 
     void run_replace_ops(std::unordered_set<token>& bootstrap_tokens, replacement_info replace_info);
     void run_bootstrap_ops(std::unordered_set<token>& bootstrap_tokens);
@@ -391,7 +407,7 @@ private:
 public:
 
     future<> check_for_endpoint_collision(std::unordered_set<gms::inet_address> initial_contact_nodes,
-            const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features);
+            const std::unordered_map<locator::host_id, sstring>& loaded_peer_features);
 
     future<> join_cluster(sharded<service::storage_proxy>& proxy,
             start_hint_manager start_hm, gms::generation_type new_generation);
@@ -414,10 +430,11 @@ private:
     bool is_replacing();
     bool is_first_node();
     raft::server* get_group_server_if_raft_topolgy_enabled();
+    future<> start_sys_dist_ks() const;
     future<> join_topology(sharded<service::storage_proxy>& proxy,
             std::unordered_set<gms::inet_address> initial_contact_nodes,
             std::unordered_map<locator::host_id, gms::loaded_endpoint_state> loaded_endpoints,
-            std::unordered_map<gms::inet_address, sstring> loaded_peer_features,
+            std::unordered_map<locator::host_id, sstring> loaded_peer_features,
             std::chrono::milliseconds,
             start_hint_manager start_hm,
             gms::generation_type new_generation);
@@ -531,11 +548,11 @@ public:
     virtual void on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {}
     virtual void on_drop_view(const sstring& ks_name, const sstring& view_name) override {}
 private:
-    std::optional<db::system_keyspace::peer_info> get_peer_info_for_update(inet_address endpoint);
+    std::optional<db::system_keyspace::peer_info> get_peer_info_for_update(locator::host_id endpoint);
     // return an engaged value iff app_state_map has changes to the peer info
-    std::optional<db::system_keyspace::peer_info> get_peer_info_for_update(inet_address endpoint, const gms::application_state_map& app_state_map);
+    std::optional<db::system_keyspace::peer_info> get_peer_info_for_update(locator::host_id endpoint, const gms::application_state_map& app_state_map);
 
-    std::unordered_set<token> get_tokens_for(inet_address endpoint);
+    std::unordered_set<token> get_tokens_for(locator::host_id endpoint);
     std::optional<locator::endpoint_dc_rack> get_dc_rack_for(const gms::endpoint_state& ep_state);
     std::optional<locator::endpoint_dc_rack> get_dc_rack_for(locator::host_id endpoint);
 private:
@@ -794,8 +811,8 @@ public:
     future<> update_fence_version(token_metadata::version_t version);
 
 private:
-    std::unordered_set<gms::inet_address> _normal_state_handled_on_boot;
-    bool is_normal_state_handled_on_boot(gms::inet_address);
+    std::unordered_set<locator::host_id> _normal_state_handled_on_boot;
+    bool is_normal_state_handled_on_boot(locator::host_id);
     future<> wait_for_normal_state_handled_on_boot();
 
     friend class group0_state_machine;
@@ -908,7 +925,8 @@ public:
     // but its intended usage is to set up the RPC connections to use the new dictionaries.
     //
     // Must be called on shard 0.
-    future<> compression_dictionary_updated_callback();
+    future<> compression_dictionary_updated_callback(std::string_view name);
+    future<> compression_dictionary_updated_callback_all();
 
     future<> do_cluster_cleanup();
 
@@ -956,6 +974,19 @@ public:
     future<> wait_for_topology_not_busy();
 
 private:
+    semaphore _do_sample_sstables_concurrency_limiter{1};
+    // To avoid overly-large RPC messages, `do_sample_sstables` is broken up into several rounds.
+    // This implements a single round.
+    future<utils::chunked_vector<temporary_buffer<char>>> do_sample_sstables_oneshot(table_id, uint64_t chunk_size, uint64_t n_chunks);
+public:
+    // SSTable sampling results can occupy a considerable amount of memory.
+    // Callers of `do_sample_sstables` should hold this semaphore until they are done with the sample,
+    // to ensure that there's only one sample around.
+    semaphore& get_do_sample_sstables_concurrency_limiter();
+    // Gathers a randomly-selected sample of chunks of (decompressed) Data files for the given table,
+    // from across the entire cluster.
+    future<utils::chunked_vector<temporary_buffer<char>>> do_sample_sstables(table_id, uint64_t chunk_size, uint64_t n_chunks);
+private:
     future<std::vector<canonical_mutation>> get_system_mutations(schema_ptr schema);
     future<std::vector<canonical_mutation>> get_system_mutations(const sstring& ks_name, const sstring& cf_name);
 
@@ -998,7 +1029,14 @@ private:
     // We need to be able to abort all group0 operation during shutdown, so we need special abort source for that
     abort_source _group0_as;
 
-    std::function<future<void>()> _compression_dictionary_updated_callback;
+    std::function<future<void>(std::string_view)> _compression_dictionary_updated_callback;
+    using byte_vector = std::vector<std::byte>;
+    std::function<future<byte_vector>(std::vector<byte_vector>)> _train_dict;
+public:
+    future<uint64_t> estimate_total_sstable_volume(table_id);
+    future<std::vector<std::byte>> train_dict(utils::chunked_vector<temporary_buffer<char>> sample);
+    future<> publish_new_sstable_dict(table_id, std::span<const std::byte>, service::raft_group0_client&);
+    void set_train_dict_callback(decltype(_train_dict));
 
     utils::disk_space_monitor* _disk_space_monitor; // != nullptr only on shard0.
 

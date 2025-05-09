@@ -22,6 +22,7 @@
 #include <seastar/util/closeable.hh>
 
 #include "db/config.hh"
+#include "db/extensions.hh"
 #include "sstables/exceptions.hh"
 #include "sstables/sstable_directory.hh"
 #include "sstables/sstables_manager.hh"
@@ -50,6 +51,11 @@ class filesystem_storage final : public sstables::storage {
 private:
     using mark_for_removal = bool_class<class mark_for_removal_tag>;
 
+    template <typename Comp>
+    requires std::is_same_v<Comp, component_type> || std::is_same_v<Comp, sstring>
+    static auto filename(const sstable& sst, sstring dir, generation_type gen, Comp comp) {
+        return sstable::filename(dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, gen, sst._format, comp);
+    }
 
     future<> check_create_links_replay(const sstable& sst, const sstring& dst_dir, generation_type dst_gen, const std::vector<std::pair<sstables::component_type, sstring>>& comps) const;
     future<> remove_temp_dir();
@@ -125,6 +131,23 @@ future<> filesystem_storage::rename_new_file(const sstable& sst, sstring from_na
     });
 }
 
+static future<file> maybe_wrap_file(const sstable& sst, component_type type, open_flags flags, future<file> f) {
+    if (type != component_type::TOC && type != component_type::TemporaryTOC) {
+        for (auto * ext : sst.manager().config().extensions().sstable_file_io_extensions()) {
+            f = with_file_close_on_failure(std::move(f), [ext, &sst, type, flags] (file f) {
+               return ext->wrap_file(sst, type, f, flags).then([f](file nf) mutable {
+                   return nf ? nf : std::move(f);
+               });
+            });
+        }
+    }
+    return f;
+}
+
+static future<file> maybe_wrap_file(const sstable& sst, component_type type, open_flags flags, file f) {
+    return maybe_wrap_file(sst, type, flags, make_ready_future<file>(std::move(f)));
+}
+
 future<file> filesystem_storage::open_component(const sstable& sst, component_type type, open_flags flags, file_open_options options, bool check_integrity) {
     auto create_flags = open_flags::create | open_flags::exclusive;
     auto readonly = (flags & create_flags) != create_flags;
@@ -141,7 +164,7 @@ future<file> filesystem_storage::open_component(const sstable& sst, component_ty
         });
     }
 
-    return f;
+    return maybe_wrap_file(sst, type, flags, std::move(f));
 }
 
 void filesystem_storage::open(sstable& sst) {
@@ -253,8 +276,8 @@ future<> filesystem_storage::check_create_links_replay(const sstable& sst, const
         const std::vector<std::pair<sstables::component_type, sstring>>& comps) const {
     return parallel_for_each(comps, [this, &sst, &dst_dir, dst_gen] (const auto& p) mutable {
         auto comp = p.second;
-        auto src = sstable::filename(_dir.native(), sst._schema->ks_name(), sst._schema->cf_name(), sst._version, sst._generation, sst._format, comp);
-        auto dst = sstable::filename(dst_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, dst_gen, sst._format, comp);
+        auto src = filename(sst, _dir.native(), sst._generation, comp);
+        auto dst = filename(sst, dst_dir, dst_gen, comp);
         return do_with(std::move(src), std::move(dst), [] (const sstring& src, const sstring& dst) mutable {
             return file_exists(dst).then([&] (bool exists) mutable {
                 if (!exists) {
@@ -323,21 +346,21 @@ future<> filesystem_storage::create_links_common(const sstable& sst, sstring dst
     auto comps = sst.all_components();
     co_await check_create_links_replay(sst, dst_dir, generation, comps);
     // TemporaryTOC is always first, TOC is always last
-    auto dst = sstable::filename(dst_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, generation, sst._format, component_type::TemporaryTOC);
+    auto dst = filename(sst, dst_dir, generation, component_type::TemporaryTOC);
     co_await sst.sstable_write_io_check(idempotent_link_file, fmt::to_string(sst.filename(component_type::TOC)), std::move(dst));
     auto dir = opened_directory(dst_dir);
     co_await dir.sync(sst._write_error_handler);
     co_await parallel_for_each(comps, [this, &sst, &dst_dir, generation] (auto p) {
-        auto src = sstable::filename(_dir.native(), sst._schema->ks_name(), sst._schema->cf_name(), sst._version, sst._generation, sst._format, p.second);
-        auto dst = sstable::filename(dst_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, generation, sst._format, p.second);
+        auto src = filename(sst, _dir.native(), sst._generation, p.second);
+        auto dst = filename(sst, dst_dir, generation, p.second);
         return sst.sstable_write_io_check(idempotent_link_file, std::move(src), std::move(dst));
     });
     co_await dir.sync(sst._write_error_handler);
-    auto dst_temp_toc = sstable::filename(dst_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, generation, sst._format, component_type::TemporaryTOC);
+    auto dst_temp_toc = filename(sst, dst_dir, generation, component_type::TemporaryTOC);
     if (mark_for_removal) {
         // Now that the source sstable is linked to new_dir, mark the source links for
         // deletion by leaving a TemporaryTOC file in the source directory.
-        auto src_temp_toc = sstable::filename(_dir.native(), sst._schema->ks_name(), sst._schema->cf_name(), sst._version, sst._generation, sst._format, component_type::TemporaryTOC);
+        auto src_temp_toc = filename(sst, _dir.native(), sst._generation, component_type::TemporaryTOC);
         co_await sst.sstable_write_io_check(rename_file, std::move(dst_temp_toc), std::move(src_temp_toc));
         co_await _dir.sync(sst._write_error_handler);
     } else {
@@ -378,10 +401,10 @@ future<> filesystem_storage::move(const sstable& sst, sstring new_dir, generatio
     co_await change_dir(new_dir);
     generation_type old_generation = sst._generation;
     co_await coroutine::parallel_for_each(sst.all_components(), [&sst, old_generation, old_dir] (auto p) {
-        return sst.sstable_write_io_check(remove_file, sstable::filename(old_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, old_generation, sst._format, p.second));
+        return sst.sstable_write_io_check(remove_file, filename(sst, old_dir, old_generation, p.second));
     });
     auto temp_toc = sstable_version_constants::get_component_map(sst._version).at(component_type::TemporaryTOC);
-    co_await sst.sstable_write_io_check(remove_file, sstable::filename(old_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, old_generation, sst._format, temp_toc));
+    co_await sst.sstable_write_io_check(remove_file, filename(sst, old_dir, old_generation, temp_toc));
     if (delay_commit == nullptr) {
         co_await when_all(sst.sstable_write_io_check(sync_directory, old_dir), _dir.sync(sst._write_error_handler)).discard_result();
     } else {
@@ -444,7 +467,7 @@ future<> filesystem_storage::wipe(const sstable& sst, sync_dir sync) noexcept {
                     co_return;
                 }
 
-                auto fname = sstable::filename(dir_name.native(), sst._schema->ks_name(), sst._schema->cf_name(), sst._version, sst._generation, sst._format, component.second);
+                auto fname = filename(sst, dir_name.native(), sst._generation, component.second);
                 try {
                     co_await sst.sstable_write_io_check(remove_file, fname);
                 } catch (...) {
@@ -595,17 +618,35 @@ void s3_storage::open(sstable& sst) {
 }
 
 future<file> s3_storage::open_component(const sstable& sst, component_type type, open_flags flags, file_open_options options, bool check_integrity) {
-    co_return _client->make_readable_file(make_s3_object_name(sst, type), _as);
+    return maybe_wrap_file(sst, type, flags, _client->make_readable_file(make_s3_object_name(sst, type), _as));
+}
+
+static future<data_sink> maybe_wrap_sink(const sstable& sst, component_type type, data_sink sink) {
+    if (type != component_type::TOC && type != component_type::TemporaryTOC) {
+        for (auto* ext : sst.manager().config().extensions().sstable_file_io_extensions()) {
+            std::exception_ptr p;
+            try {
+                sink = co_await ext->wrap_sink(sst, type, std::move(sink));
+            } catch (...) {
+                p = std::current_exception();
+            }
+            if (p) {
+                co_await sink.close();
+                std::rethrow_exception(std::move(p));
+            }
+        }
+    }
+    co_return sink;
 }
 
 future<data_sink> s3_storage::make_data_or_index_sink(sstable& sst, component_type type) {
     SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
     // FIXME: if we have file size upper bound upfront, it's better to use make_upload_sink() instead
-    co_return _client->make_upload_jumbo_sink(make_s3_object_name(sst, type), std::nullopt, _as);
+    return maybe_wrap_sink(sst, type, _client->make_upload_jumbo_sink(make_s3_object_name(sst, type), std::nullopt, _as));
 }
 
 future<data_sink> s3_storage::make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) {
-    co_return _client->make_upload_sink(make_s3_object_name(sst, type), _as);
+    return maybe_wrap_sink(sst, type, _client->make_upload_sink(make_s3_object_name(sst, type), _as));
 }
 
 future<> s3_storage::seal(const sstable& sst) {

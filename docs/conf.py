@@ -64,7 +64,7 @@ extensions = [
 ]
 
 # The suffix(es) of source filenames.
-source_suffix = ['.rst']
+source_suffix = ['.rst', '.md']
 
 # The master toctree document.
 master_doc = "index"
@@ -196,7 +196,7 @@ htmlhelp_basename = "ScyllaDocumentationdoc"
 html_baseurl = BASE_URL
 
 # Dictionary of values to pass into the template engine’s context for all pages
-html_context = {"html_baseurl": html_baseurl}
+html_context = {"html_baseurl": html_baseurl, "flag": FLAG}
 
 def setup(app):
     if 'opensource' in app.tags:

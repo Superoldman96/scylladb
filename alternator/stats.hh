@@ -12,6 +12,7 @@
 
 #include <seastar/core/metrics_registration.hh>
 #include "utils/histogram.hh"
+#include "utils/estimated_histogram.hh"
 #include "cql3/stats.hh"
 
 namespace alternator {
@@ -75,6 +76,9 @@ public:
         utils::timed_rate_moving_average_summary_and_histogram batch_write_item_latency;
         utils::timed_rate_moving_average_summary_and_histogram batch_get_item_latency;
         utils::timed_rate_moving_average_summary_and_histogram get_records_latency;
+
+        utils::estimated_histogram batch_get_item_histogram{22}; // a histogram that covers the range 1 - 100
+        utils::estimated_histogram batch_write_item_histogram{22}; // a histogram that covers the range 1 - 100
     } api_operations;
     // Miscellaneous event counters
     uint64_t total_operations = 0;
@@ -84,7 +88,7 @@ public:
     uint64_t shard_bounce_for_lwt = 0;
     uint64_t requests_blocked_memory = 0;
     uint64_t requests_shed = 0;
-    uint64_t rcu_total = 0;
+    uint64_t rcu_half_units_total = 0;
     // wcu can results from put, update, delete and index
     // Index related will be done on top of the operation it comes with
     enum wcu_types {

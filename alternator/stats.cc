@@ -14,7 +14,20 @@
 namespace alternator {
 
 const char* ALTERNATOR_METRICS = "alternator";
-
+static seastar::metrics::histogram estimated_histogram_to_metrics(const utils::estimated_histogram& histogram) {
+    seastar::metrics::histogram res;
+    res.buckets.resize(histogram.bucket_offsets.size());
+    uint64_t cumulative_count = 0;
+    res.sample_count = histogram._count;
+    res.sample_sum = histogram._sample_sum;
+    for (size_t i = 0; i < res.buckets.size(); i++) {
+        auto& v = res.buckets[i];
+        v.upper_bound = histogram.bucket_offsets[i];
+        cumulative_count += histogram.buckets[i];
+        v.count = cumulative_count;
+    }
+    return res;
+}
 stats::stats() : api_operations{} {
     // Register the
     seastar::metrics::label op("op");
@@ -95,22 +108,26 @@ stats::stats() : api_operations{} {
                     seastar::metrics::description("number of rows read during filtering operations"))(alternator_label).set_skip_when_empty(),
             seastar::metrics::make_total_operations("filtered_rows_matched_total", cql_stats.filtered_rows_matched_total,
                     seastar::metrics::description("number of rows read and matched during filtering operations")),
-            seastar::metrics::make_counter("rcu_total", rcu_total,
-                    seastar::metrics::description("total number of consumed read units, counted as half units"))(alternator_label).set_skip_when_empty(),
+            seastar::metrics::make_counter("rcu_total", [this]{return 0.5 * rcu_half_units_total;},
+                    seastar::metrics::description("total number of consumed read units"))(alternator_label).set_skip_when_empty(),
             seastar::metrics::make_counter("wcu_total", wcu_total[wcu_types::PUT_ITEM],
-                    seastar::metrics::description("total number of consumed write units, counted as half units"),{op("PutItem")})(alternator_label).set_skip_when_empty(),
+                    seastar::metrics::description("total number of consumed write units"),{op("PutItem")})(alternator_label).set_skip_when_empty(),
             seastar::metrics::make_counter("wcu_total", wcu_total[wcu_types::DELETE_ITEM],
-                    seastar::metrics::description("total number of consumed write units, counted as half units"),{op("DeleteItem")})(alternator_label).set_skip_when_empty(),
+                    seastar::metrics::description("total number of consumed write units"),{op("DeleteItem")})(alternator_label).set_skip_when_empty(),
             seastar::metrics::make_counter("wcu_total", wcu_total[wcu_types::UPDATE_ITEM],
-                    seastar::metrics::description("total number of consumed write units, counted as half units"),{op("UpdateItem")})(alternator_label).set_skip_when_empty(),
+                    seastar::metrics::description("total number of consumed write units"),{op("UpdateItem")})(alternator_label).set_skip_when_empty(),
             seastar::metrics::make_counter("wcu_total", wcu_total[wcu_types::INDEX],
-                    seastar::metrics::description("total number of consumed write units, counted as half units"),{op("Index")})(alternator_label).set_skip_when_empty(),
+                    seastar::metrics::description("total number of consumed write units"),{op("Index")})(alternator_label).set_skip_when_empty(),
             seastar::metrics::make_total_operations("filtered_rows_dropped_total", [this] { return cql_stats.filtered_rows_read_total - cql_stats.filtered_rows_matched_total; },
                     seastar::metrics::description("number of rows read and dropped during filtering operations"))(alternator_label).set_skip_when_empty(),
             seastar::metrics::make_counter("batch_item_count", seastar::metrics::description("The total number of items processed across all batches"),{op("BatchWriteItem")},
                     api_operations.batch_write_item_batch_total)(alternator_label).set_skip_when_empty(),
             seastar::metrics::make_counter("batch_item_count", seastar::metrics::description("The total number of items processed across all batches"),{op("BatchGetItem")},
                     api_operations.batch_get_item_batch_total)(alternator_label).set_skip_when_empty(),
+            seastar::metrics::make_histogram("batch_item_count_histogram", seastar::metrics::description("Histogram of the number of items in a batch request"),{op("BatchGetItem")},
+                    [this]{ return estimated_histogram_to_metrics(api_operations.batch_get_item_histogram);})(alternator_label).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
+            seastar::metrics::make_histogram("batch_item_count_histogram", seastar::metrics::description("Histogram of the number of items in a batch request"),{op("BatchWriteItem")},
+                    [this]{ return estimated_histogram_to_metrics(api_operations.batch_write_item_histogram);})(alternator_label).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
     });
 }
 

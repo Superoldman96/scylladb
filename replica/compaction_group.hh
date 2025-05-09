@@ -56,7 +56,7 @@ class compaction_group {
     std::vector<sstables::shared_sstable> _sstables_compacted_but_not_deleted;
     seastar::condition_variable _staging_done_condition;
     // Gates async operations confined to a single group.
-    seastar::gate _async_gate;
+    seastar::named_gate _async_gate;
     bool _tombstone_gc_enabled = true;
 private:
     // Adds new sstable to the set of sstables
@@ -159,9 +159,11 @@ public:
     future<> merge_sstables_from(compaction_group& group);
 
     const lw_shared_ptr<sstables::sstable_set>& main_sstables() const noexcept;
+    sstables::sstable_set make_main_sstable_set() const;
     void set_main_sstables(lw_shared_ptr<sstables::sstable_set> new_main_sstables);
 
     const lw_shared_ptr<sstables::sstable_set>& maintenance_sstables() const noexcept;
+    lw_shared_ptr<sstables::sstable_set> make_maintenance_sstable_set() const;
     void set_maintenance_sstables(lw_shared_ptr<sstables::sstable_set> new_maintenance_sstables);
 
     // Makes a sstable set, which includes all sstables managed by this group
@@ -184,7 +186,7 @@ public:
         return _staging_done_condition;
     }
 
-    seastar::gate& async_gate() noexcept {
+    seastar::named_gate& async_gate() noexcept {
         return _async_gate;
     }
 
@@ -211,7 +213,7 @@ class storage_group {
     // eventually have all their data moved into main group.
     std::vector<compaction_group_ptr> _merging_groups;
     std::vector<compaction_group_ptr> _split_ready_groups;
-    seastar::gate _async_gate;
+    seastar::named_gate _async_gate;
 private:
     bool splitting_mode() const {
         return !_split_ready_groups.empty();
@@ -220,7 +222,7 @@ private:
 public:
     storage_group(compaction_group_ptr cg);
 
-    seastar::gate& async_gate() {
+    seastar::named_gate& async_gate() {
         return _async_gate;
     }
 
@@ -357,12 +359,12 @@ public:
     virtual void update_effective_replication_map(const locator::effective_replication_map& erm, noncopyable_function<void()> refresh_mutation_source) = 0;
 
     virtual compaction_group& compaction_group_for_token(dht::token token) const = 0;
-    virtual utils::chunked_vector<compaction_group*> compaction_groups_for_token_range(dht::token_range tr) const = 0;
     virtual compaction_group& compaction_group_for_key(partition_key_view key, const schema_ptr& s) const = 0;
     virtual compaction_group& compaction_group_for_sstable(const sstables::shared_sstable& sst) const = 0;
 
     virtual size_t log2_storage_groups() const = 0;
     virtual storage_group& storage_group_for_token(dht::token) const = 0;
+    virtual utils::chunked_vector<storage_group_ptr> storage_groups_for_token_range(dht::token_range tr) const = 0;
 
     virtual locator::table_load_stats table_load_stats(std::function<bool(const locator::tablet_map&, locator::global_tablet_id)> tablet_filter) const noexcept = 0;
     virtual bool all_storage_groups_split() = 0;

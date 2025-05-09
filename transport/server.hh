@@ -245,11 +245,10 @@ private:
                 service_permit>;
         static thread_local execution_stage_type _process_request_stage;
     public:
-        connection(cql_server& server, socket_address server_addr, connected_socket&& fd, socket_address addr);
+        connection(cql_server& server, socket_address server_addr, connected_socket&& fd, socket_address addr, named_semaphore& sem, semaphore_units<named_semaphore_exception_factory> initial_sem_units);
         virtual ~connection();
         future<> process_request() override;
         void handle_error(future<>&& f) override;
-        void on_connection_close() override;
         client_data make_client_data() const;
         const service::client_state& get_client_state() const { return _client_state; }
         void update_scheduling_group();
@@ -257,6 +256,8 @@ private:
         scheduling_group get_scheduling_group() const { return _current_scheduling_group; }
     private:
         friend class process_request_executor;
+
+        future<foreign_ptr<std::unique_ptr<cql_server::response>>> sleep_until_timeout_passes(const seastar::lowres_clock::time_point& timeout, std::unique_ptr<cql_server::response>&& resp) const;
         future<foreign_ptr<std::unique_ptr<cql_server::response>>> process_request_one(fragmented_temporary_buffer::istream buf, uint8_t op, uint16_t stream, service::client_state& client_state, tracing_request_type tracing_request, service_permit permit);
         unsigned frame_size() const;
         unsigned pick_request_cpu();
@@ -336,7 +337,7 @@ private:
     friend class type_codec;
 
 private:
-    virtual shared_ptr<generic_server::connection> make_connection(socket_address server_addr, connected_socket&& fd, socket_address addr) override;
+    virtual shared_ptr<generic_server::connection> make_connection(socket_address server_addr, connected_socket&& fd, socket_address addr, named_semaphore& sem, semaphore_units<named_semaphore_exception_factory> initial_sem_units) override;
     future<> advertise_new_connection(shared_ptr<generic_server::connection> conn) override;
     future<> unadvertise_connection(shared_ptr<generic_server::connection> conn) override;
 

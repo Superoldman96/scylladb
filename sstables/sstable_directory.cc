@@ -12,6 +12,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/util/file.hh>
+#include <seastar/util/lazy.hh>
 #include <boost/algorithm/string.hpp>
 #include "sstables/sstable_directory.hh"
 #include "sstables/sstables.hh"
@@ -242,6 +243,10 @@ sstable_directory::process_descriptor(sstables::entry_descriptor desc,
     auto shards = co_await get_shards_for_this_sstable(desc, storage_opts, flags);
     if (flags.sort_sstables_according_to_owner && shards.size() == 1 && shards[0] != this_shard_id()) {
         // identified a remote unshared sstable
+        dirlog.trace("{} identified as a remote unshared SSTable, shard={}", seastar::value_of([this, &desc] {
+                return sstable::component_basename(_schema->ks_name(), _schema->cf_name(),
+                        desc.version, desc.generation, desc.format, component_type::Data);
+            }), shards[0]);
         _unshared_remote_sstables[shards[0]].push_back(std::move(desc));
         co_return;
     }
@@ -497,7 +502,7 @@ sstable_directory::move_foreign_sstables(sharded<sstable_directory>& source_dire
         }
         // Should be empty, since an SSTable that belongs to this shard is not remote.
         SCYLLA_ASSERT(shard_id != this_shard_id());
-        dirlog.debug("Moving {} unshared SSTables to shard {} ", info_vec.size(), shard_id);
+        dirlog.debug("Moving {} unshared SSTables of {}.{} to shard {} ", info_vec.size(), _schema->ks_name(), _schema->cf_name(), shard_id);
         return source_directory.invoke_on(shard_id, &sstables::sstable_directory::load_foreign_sstables, std::move(info_vec));
     });
 }
@@ -758,16 +763,6 @@ future<> sstable_directory::filesystem_components_lister::handle_sstables_pendin
     }));
 
     co_await when_all_succeed(futures.begin(), futures.end()).discard_result();
-}
-
-future<sstables::generation_type>
-highest_generation_seen(sharded<sstables::sstable_directory>& directory) {
-    co_return co_await directory.map_reduce0(
-        std::mem_fn(&sstables::sstable_directory::highest_generation_seen),
-        sstables::generation_type{},
-        [] (sstables::generation_type a, sstables::generation_type b) {
-            return std::max(a, b);
-        });
 }
 
 }

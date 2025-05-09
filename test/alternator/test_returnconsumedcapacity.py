@@ -291,3 +291,91 @@ def test_long_update(test_table):
         ExpressionAttributeValues={':val1': val1},
         ReturnConsumedCapacity='TOTAL', ReturnValues='ALL_OLD')
     assert 3 == response['ConsumedCapacity']["CapacityUnits"]
+
+# A simple batch getItem test
+# This test validates that when two items are fetched from the same table using BatchGetItem,
+# the ReturnConsumedCapacity field reflects the sum of independent RCU calculations for each item.
+# Consistency is defined per table in the BatchGetItem request, so both items share the same
+# consistency setting. The test ensures that RCU is calculated independently for each item
+# according to that setting, and the total consumed capacity is their sum.
+def test_simple_batch_get_items(test_table_sb):
+    p1 = random_string()
+    val = random_string()
+    c1 = random_bytes()
+    test_table_sb.put_item(Item={'p': p1, 'c': c1})
+
+    p2 = random_string()
+    c2 = random_bytes()
+    test_table_sb.put_item(Item={'p': p2, 'c': c2})
+
+    response = test_table_sb.meta.client.batch_get_item(RequestItems = {
+            test_table_sb.name: {'Keys': [{'p': p1, 'c': c1}, {'p': p2, 'c': c2}], 'ConsistentRead': True}}, ReturnConsumedCapacity='TOTAL')
+    assert 'ConsumedCapacity' in response
+    assert 'TableName' in response['ConsumedCapacity'][0]
+    assert response['ConsumedCapacity'][0]['TableName'] == test_table_sb.name
+    assert 2 == response['ConsumedCapacity'][0]['CapacityUnits']
+
+# Validate that when getting a batch of requests
+# From multiple tables we get an RCU for each of the tables
+# We also validate that the eventual consistency return half the units
+def test_multi_table_batch_get_items(test_table_s, test_table):
+    keys1 = []
+    for i in range(5):
+        p = random_string()
+        test_table_s.put_item(Item={'p': p})
+        keys1.append({'p': p})
+    keys2 = []
+    for i in range(3):
+        p = random_string()
+        c = random_string()
+        test_table.put_item(Item={'p': p, 'c': c}, ReturnConsumedCapacity='TOTAL')
+        keys2.append({'p': p, 'c': c})
+
+    response = test_table.meta.client.batch_get_item(RequestItems = {
+            test_table_s.name: {'Keys': keys1, 'ConsistentRead': True},
+            test_table.name: {'Keys': keys2, 'ConsistentRead': False}}, ReturnConsumedCapacity='TOTAL')
+    for cc in response['ConsumedCapacity']:
+        if cc['TableName'] == test_table_s.name:
+            assert cc["CapacityUnits"] == 5
+        else:
+            assert cc['TableName'] == test_table.name
+            assert cc["CapacityUnits"] == 1.5
+
+# A simple batch write item test
+# This test validates that when two items are inserted into the same table using BatchWriteItem,
+# the ReturnConsumedCapacity field reflects the sum of independent WCU calculations for each item.
+# The test ensures that WCU is calculated independently for each item,
+# and that the total consumed capacity is the sum of both.
+def test_simple_batch_write_item(test_table_s):
+    p1 = random_string()
+    p2 = random_string()
+    response = test_table_s.meta.client.batch_write_item(RequestItems = {
+        test_table_s.name: [{'PutRequest': {'Item': {'p': p1, 'a': 'hi'}}}, {'PutRequest': {'Item': {'p': p2, 'a': 'hi'}}}]
+    }, ReturnConsumedCapacity='TOTAL')
+    assert 'ConsumedCapacity' in response
+    assert 'TableName' in response['ConsumedCapacity'][0]
+    assert response['ConsumedCapacity'][0]['TableName'] == test_table_s.name
+    assert 2 == response['ConsumedCapacity'][0]['CapacityUnits']
+
+
+# Validate that when updating a batch of requests
+# across multiple tables, we get a WCU for each table.
+# Also validate that delete operations are counted as 1 WCU.
+def test_multi_table_batch_write_item(test_table_s, test_table):
+    p = random_string()
+    c = random_string()
+    test_table.put_item(Item={'p': p, 'c': c})
+
+    table_s_items = [{'PutRequest': {'Item': {'p':  random_string(), 'a': 'hi'}}} for i in range(3)]
+    table_s_items.append({'PutRequest': {'Item': {'p':  random_string(), 'a': 'a' * KB}}})
+    table_items = [{'PutRequest': {'Item': {'p':  random_string(), 'c': random_string()}}}, {'DeleteRequest': {'Key': {'p':  p, 'c': c}}}]
+    response = test_table_s.meta.client.batch_write_item(RequestItems = {
+        test_table_s.name: table_s_items,
+        test_table.name: table_items
+    }, ReturnConsumedCapacity='TOTAL')
+    for cc in response['ConsumedCapacity']:
+        if cc['TableName'] == test_table_s.name:
+            assert cc["CapacityUnits"] == 5
+        else:
+            assert cc['TableName'] == test_table.name
+            assert cc["CapacityUnits"] == 2

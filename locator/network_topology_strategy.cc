@@ -308,7 +308,7 @@ future<tablet_map> network_topology_strategy::allocate_tablets_for_new_table(sch
 future<tablet_map> network_topology_strategy::reallocate_tablets(schema_ptr s, token_metadata_ptr tm, tablet_map tablets) const {
     natural_endpoints_tracker::check_enough_endpoints(*tm, _dc_rep_factor);
     load_sketch load(tm);
-    co_await load.populate();
+    co_await load.populate(std::nullopt, s->id());
 
     tablet_logger.debug("Allocating tablets for {}.{} ({}): dc_rep_factor={} tablet_count={}", s->ks_name(), s->cf_name(), s->id(), _dc_rep_factor, tablets.tablet_count());
 
@@ -401,7 +401,7 @@ future<tablet_replica_set> network_topology_strategy::add_tablets_in_dc(schema_p
             }
             const auto& host_id = node.get().host_id();
             if (!existing.contains(host_id)) {
-                candidate.nodes.emplace_back(host_id, load.get_load(host_id));
+                candidate.nodes.emplace_back(host_id, load.get_avg_shard_load(host_id));
             }
         }
         if (candidate.nodes.empty()) {

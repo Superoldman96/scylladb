@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+from random import randint
+
 import colorama
 import glob
 import itertools
@@ -32,13 +34,20 @@ import humanfriendly
 import treelib
 
 from scripts import coverage
+from test import ALL_MODES, TOP_SRC_DIR, path_to
 from test.pylib import coverage_utils
-from test.pylib.cpp.ldap.prepare_instance import try_something_backoff, can_connect
-from test.pylib.suite.base import Test, TestSuite, all_modes, init_testsuite_globals, output_is_a_tty, palette, path_to
+from test.pylib.suite.base import (
+    Test,
+    TestSuite,
+    init_testsuite_globals,
+    output_is_a_tty,
+    palette,
+    prepare_dirs,
+    start_3rd_party_services,
+)
 from test.pylib.suite.boost import BoostTest
-from test.pylib.suite.ldap import LdapTest
 from test.pylib.resource_gather import setup_cgroup, run_resource_watcher
-from test.pylib.util import LogPrefixAdapter, get_configured_modes, ninja, prepare_dirs, start_s3_mock_services
+from test.pylib.util import LogPrefixAdapter, get_configured_modes, ninja
 
 if TYPE_CHECKING:
     from typing import List
@@ -127,16 +136,12 @@ def parse_cmd_line() -> argparse.Namespace:
                 "boost/memtable_test::test_hash_is_cached" to narrow down to
                 a certain test case. Default: run all tests in all suites.""",
     )
-    parser.add_argument(
-        "--tmpdir",
-        action="store",
-        default="testlog",
-        help="""Path to temporary test data and log files. The data is
-        further segregated per build mode. Default: ./testlog.""",
-    )
+    parser.add_argument("--tmpdir", action="store", default=str(TOP_SRC_DIR / "testlog"),
+                        help="Path to temporary test data and log files.  The data is further segregated per build mode.")
     parser.add_argument("--gather-metrics", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--max-failures", type=int, default=-1, help="Maximum number of failures to tolerate before cancelling rest of tests.")
-    parser.add_argument('--mode', choices=all_modes.keys(), action="append", dest="modes",
+    parser.add_argument("--max-failures", type=int, default=0,
+                        help="Maximum number of failures to tolerate before cancelling rest of tests.")
+    parser.add_argument('--mode', choices=ALL_MODES, action="append", dest="modes",
                         help="Run only tests for given build mode(s)")
     parser.add_argument('--repeat', action="store", default="1", type=int,
                         help="number of times to repeat test execution")
@@ -193,7 +198,7 @@ def parse_cmd_line() -> argparse.Namespace:
                              "CLUSTER_POOL_SIZE can be used to achieve the same")
     parser.add_argument('--manual-execution', action='store_true', default=False,
                         help='Let me manually run the test executable at the moment this script would run it')
-    parser.add_argument('--byte-limit', action="store", default=None, type=int,
+    parser.add_argument('--byte-limit', action="store", default=randint(0, 2000), type=int,
                         help="Specific byte limit for failure injection (random by default)")
     scylla_additional_options = parser.add_argument_group('Additional options for Scylla tests')
     scylla_additional_options.add_argument('--x-log2-compaction-groups', action="store", default="0", type=int,
@@ -247,7 +252,7 @@ def parse_cmd_line() -> argparse.Namespace:
         args.coverage = True
 
     args.tmpdir = os.path.abspath(args.tmpdir)
-    prepare_dirs(tempdir_base=args.tmpdir, modes=args.modes)
+    prepare_dirs(tempdir_base=pathlib.Path(args.tmpdir), modes=args.modes, gather_metrics=args.gather_metrics)
 
     # Get the list of tests configured by configure.py
     try:
@@ -311,7 +316,7 @@ async def run_all_tests(signaled: asyncio.Event, options: argparse.Namespace) ->
                 console.print_progress(result)
         return failed
 
-    await start_s3_mock_services(minio_tempdir_base=options.tmpdir)
+    await start_3rd_party_services(tempdir_base=pathlib.Path(options.tmpdir), toxiproxy_byte_limit=options.byte_limit)
 
     console.print_start_blurb()
     max_failures = options.max_failures
@@ -324,7 +329,7 @@ async def run_all_tests(signaled: asyncio.Event, options: argparse.Namespace) ->
                 # Wait for some task to finish
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 failed += await reap(done, pending, signaled)
-                if 0 < max_failures <= failed:
+                if max_failures != 0 and max_failures <= failed:
                     print("Too much failures, stopping")
                     await cancel(pending, "Too much failures, stopping")
             pending.add(asyncio.create_task(test.suite.run(test, options)))
@@ -333,7 +338,7 @@ async def run_all_tests(signaled: asyncio.Event, options: argparse.Namespace) ->
         while len(pending) > 1:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             failed += await reap(done, pending, signaled)
-            if 0 < max_failures <= failed:
+            if max_failures != 0 and max_failures <= failed:
                 print("Too much failures, stopping")
                 await cancel(pending, "Too much failures, stopping")
     except asyncio.CancelledError:
@@ -536,7 +541,6 @@ async def main() -> int:
     options = parse_cmd_line()
 
     open_log(options.tmpdir, f"test.py.{'-'.join(options.modes)}.log", options.log_level)
-    setup_cgroup(options.gather_metrics)
 
     init_testsuite_globals()
 
@@ -557,28 +561,16 @@ async def main() -> int:
 
     setup_signal_handlers(asyncio.get_running_loop(), signaled)
 
-    tp_server = None
     try:
-        if [t for t in TestSuite.all_tests() if isinstance(t, LdapTest)]:
-            tp_server = subprocess.Popen('toxiproxy-server', stderr=subprocess.DEVNULL)
-            def can_connect_to_toxiproxy():
-                return can_connect(('127.0.0.1', 8474))
-            if not try_something_backoff(can_connect_to_toxiproxy):
-                raise Exception('Could not connect to toxiproxy')
-
-        try:
-            logging.info('running all tests')
-            await run_all_tests(signaled, options)
-            logging.info('after running all tests')
-            stop_event.set()
-            async with asyncio.timeout(5):
-                await resource_watcher
-        except Exception as e:
-            print(palette.fail(e))
-            raise
-    finally:
-        if tp_server is not None:
-            tp_server.terminate()
+        logging.info('running all tests')
+        await run_all_tests(signaled, options)
+        logging.info('after running all tests')
+        stop_event.set()
+        async with asyncio.timeout(5):
+            await resource_watcher
+    except Exception as e:
+        print(palette.fail(e))
+        raise
 
     if signaled.is_set():
         return -signaled.signo      # type: ignore

@@ -951,6 +951,46 @@ class sstring:
         return self.as_hex()
 
 
+class managed_bytes:
+    def __init__(self, val):
+        self.val = val
+
+    def is_multi_chunk(self):
+        return int(self.val['_inline_size']) < -1;
+
+    def is_single_chunk(self):
+        return int(self.val['_inline_size']) == -1;
+
+    def is_inline(self):
+        return int(self.val['_inline_size']) >= 0;
+
+    def __len__(self):
+        if self.is_multi_chunk():
+            return int(self.val['_u']['multi_chunk_ref']['size'])
+        elif self.is_single_chunk():
+            return int(self.val['_u']['single_chunk_ref']['size'])
+        else:
+            return int(self.val['_inline_size'])
+
+    def get(self):
+        inf = gdb.selected_inferior()
+
+        def to_bytes(data, size):
+            return bytes(inf.read_memory(data, size))
+
+        if self.is_inline():
+            return to_bytes(self.val['_u']['inline_data'], int(self.val['_inline_size']))
+        elif self.is_single_chunk():
+            return to_bytes(self.val['_u']['single_chunk_ref']['ptr']['data'], int(self.val['_u']['single_chunk_ref']['size']))
+        else:
+            ref = self.val['_u']['multi_chunk_ref']['ptr']
+            chunks = list()
+            while ref['ptr']:
+                chunks.append(to_bytes(ref['ptr']['data'], int(ref['ptr']['frag_size'])))
+                ref = ref['ptr']['next']
+            return b''.join(chunks)
+
+
 def uint64_t(val):
     val = int(val)
     if val < 0:
@@ -1015,25 +1055,10 @@ class managed_bytes_printer(gdb.printing.PrettyPrinter):
     'print a managed_bytes'
 
     def __init__(self, val):
-        self.val = val
+        self.val = managed_bytes(val)
 
     def pure_bytes(self):
-        inf = gdb.selected_inferior()
-
-        def to_bytes(data, size):
-            return bytes(inf.read_memory(data, size))
-
-        if self.val['_inline_size'] >= 0:
-            return to_bytes(self.val['_u']['inline_data'], int(self.val['_inline_size']))
-        elif self.val['_inline_size'] == -1:
-            return to_bytes(self.val['_u']['single_chunk_ref']['ptr']['data'], int(self.val['_u']['single_chunk_ref']['size']))
-        else:
-            ref = self.val['_u']['multi_chunk_ref']['ptr']
-            chunks = list()
-            while ref['ptr']:
-                chunks.append(to_bytes(ref['ptr']['data'], int(ref['ptr']['frag_size'])))
-                ref = ref['ptr']['next']
-            return b''.join(chunks)
+        return self.val.get()
 
     def bytes_as_hex(self):
         return self.pure_bytes().hex()
@@ -2036,6 +2061,12 @@ class seastar_lw_shared_ptr():
             return self.ref['_p'].cast(self.elem_type.pointer())
         else:
             return self.ref['_p'].cast(self._no_esft_type())['_value'].address
+
+    def __nonzero__(self):
+        return bool(self.ref['_p'])
+
+    def __bool__(self):
+        return self.__nonzero__()
 
 
 class lsa_region():
@@ -3598,7 +3629,11 @@ def get_local_task_queues():
 def get_local_io_queues():
     """ Return a list of io queues for the local reactor. """
     for dev, ioq in unordered_map(gdb.parse_and_eval('\'seastar\'::local_engine._io_queues')):
-        yield dev, std_unique_ptr(ioq).dereference()
+        try:
+            ioq_ptr = seastar_shared_ptr(ioq).get().dereference()
+        except gdb.error:
+            ioq_ptr = std_unique_ptr(ioq).dereference()
+        yield dev, ioq_ptr
 
 
 def get_local_tasks(tq_id = None):
@@ -4396,7 +4431,7 @@ class scylla_gms(gdb.Command):
                 state = state_ptr.get().dereference()
             except Exception:
                 pass
-            ip = ip_to_str(int(get_ip(endpoint)), byteorder=sys.byteorder)
+            ip = ip_to_str(int(get_ip(state['_ip'])), byteorder=sys.byteorder)
             gdb.write('%s: (gms::endpoint_state*) %s (%s)\n' % (ip, state.address, state['_heart_beat_state']))
             try:
                 app_states_map = std_unordered_map(state['_application_state'])
@@ -4990,8 +5025,10 @@ class scylla_small_objects(gdb.Command):
     [2019] 0x635002ecbc60
     """
     class small_object_iterator():
-        def __init__(self, small_pool, resolve_symbols):
-            self._small_pool = small_pool
+        def __init__(self, small_pools, resolve_symbols):
+            self._small_pools = small_pools
+            self._small_pool_addresses = [small_pool.address for small_pool in small_pools]
+            self._object_size = int(small_pools[0]['_object_size'])
             self._resolve_symbols = resolve_symbols
 
             self._text_ranges = get_text_ranges()
@@ -5000,8 +5037,9 @@ class scylla_small_objects(gdb.Command):
             self._free_in_pool = set()
             self._free_in_span = set()
 
-            pool_next_free = self._small_pool['_free']
-            while pool_next_free:
+            for small_pool in self._small_pools:
+              pool_next_free = small_pool['_free']
+              while pool_next_free:
                 self._free_in_pool.add(int(pool_next_free))
                 pool_next_free = pool_next_free.reinterpret_cast(self._free_object_ptr).dereference()
 
@@ -5012,7 +5050,7 @@ class scylla_small_objects(gdb.Command):
             # Let any StopIteration bubble up, as it signals we are done with
             # all spans.
             span = next(self._span_it)
-            while span.pool() != self._small_pool.address:
+            while span.pool() not in self._small_pool_addresses:
                 span = next(self._span_it)
 
             self._free_in_span = set()
@@ -5035,7 +5073,7 @@ class scylla_small_objects(gdb.Command):
                 pass
 
             span_start, span_end = self._next_span()
-            self._obj_it = iter(range(span_start, span_end, int(self._small_pool['_object_size'])))
+            self._obj_it = iter(range(span_start, span_end, int(self._object_size)))
             return next(self._obj_it)
 
         def __next__(self):
@@ -5071,16 +5109,14 @@ class scylla_small_objects(gdb.Command):
         return [int(small_pools['_u']['a'][i]['_object_size']) for i in range(nr)]
 
     @staticmethod
-    def find_small_pool(object_size):
+    def find_small_pools(object_size):
         cpu_mem = gdb.parse_and_eval('\'seastar::memory::cpu_mem\'')
         small_pools = cpu_mem['small_pools']
+        small_pools_a = small_pools['_u']['a']
         nr = int(small_pools['nr_small_pools'])
-        for i in range(nr):
-            sp = small_pools['_u']['a'][i]
-            if object_size == int(sp['_object_size']):
-                return sp
-
-        return None
+        return [small_pools_a[i]
+                for i in range(nr)
+                if int(small_pools_a[i]['_object_size']) == object_size]
 
     def init_parser(self):
         parser = argparse.ArgumentParser(description="scylla small-objects")
@@ -5097,10 +5133,10 @@ class scylla_small_objects(gdb.Command):
 
         self._parser = parser
 
-    def get_objects(self, small_pool, offset=0, count=0, resolve_symbols=False, verbose=False):
-        if self._last_object_size != int(small_pool['_object_size']) or offset < self._last_pos:
+    def get_objects(self, small_pools, offset=0, count=0, resolve_symbols=False, verbose=False):
+        if self._last_object_size != int(small_pools[0]['_object_size']) or offset < self._last_pos:
             self._last_pos = 0
-            self._iterator = scylla_small_objects.small_object_iterator(small_pool, resolve_symbols)
+            self._iterator = scylla_small_objects.small_object_iterator(small_pools, resolve_symbols)
 
         skip = offset - self._last_pos
         if verbose:
@@ -5130,15 +5166,15 @@ class scylla_small_objects(gdb.Command):
         except SystemExit:
             return
 
-        small_pool = scylla_small_objects.find_small_pool(args.object_size)
-        if small_pool is None:
+        small_pools = scylla_small_objects.find_small_pools(args.object_size)
+        if not small_pools:
             raise ValueError("{} is not a valid object size for any small pools, valid object sizes are: {}", scylla_small_objects.get_object_sizes())
 
         if args.summarize:
             if self._last_object_size != args.object_size:
                 if args.verbose:
                     gdb.write("Object size changed ({} -> {}), scanning pool.\n".format(self._last_object_size, args.object_size))
-                self._num_objects = len(self.get_objects(small_pool, verbose=args.verbose))
+                self._num_objects = len(self.get_objects(small_pools, verbose=args.verbose))
                 self._last_object_size = args.object_size
             gdb.write("number of objects: {}\n"
                       "page size        : {}\n"
@@ -5153,7 +5189,7 @@ class scylla_small_objects(gdb.Command):
             if self._last_object_size != args.object_size:
                 if args.verbose:
                     gdb.write("Object size changed ({} -> {}), scanning pool.\n".format(self._last_object_size, args.object_size))
-                self._num_objects = len(self.get_objects(small_pool, verbose=args.verbose))
+                self._num_objects = len(self.get_objects(small_pools, verbose=args.verbose))
                 self._last_object_size = args.object_size
             page = random.randint(0, int(self._num_objects / args.page_size) - 1)
         else:
@@ -5161,7 +5197,7 @@ class scylla_small_objects(gdb.Command):
 
         offset = page * args.page_size
         gdb.write("page {}: {}-{}\n".format(page, offset, offset + args.page_size - 1))
-        for i, (obj, sym) in enumerate(self.get_objects(small_pool, offset, args.page_size, resolve_symbols=True, verbose=args.verbose)):
+        for i, (obj, sym) in enumerate(self.get_objects(small_pools, offset, args.page_size, resolve_symbols=True, verbose=args.verbose)):
             if sym is None:
                 sym_text = ""
             else:
@@ -6082,32 +6118,113 @@ class scylla_features(gdb.Command):
             gdb.write('%s: %s\n' % (f['_name'], f['_enabled']))
 
 class scylla_repairs(gdb.Command):
-    """ List all active repair instances for both repair masters and followers.
+    """List all active repair instances that involve this node and shard, for both repair masters and followers.
+
+    See `scylla repairs --help` for a list of available options.
 
     Example:
 
-       (repair_meta*) for masters: addr = 0x600005abf830, table = myks2.standard1, ip = 127.0.0.1, states = ['127.0.0.1->repair_state::get_sync_boundary_started', '127.0.0.3->repair_state::get_sync_boundary_finished'], repair_meta = (repair_meta*) 0x60400af3f8e0
-       (repair_meta*) for masters: addr = 0x60000521f830, table = myks2.standard1, ip = 127.0.0.1, states = ['127.0.0.1->repair_state::get_sync_boundary_started', '127.0.0.2->repair_state::get_sync_boundary_started'], repair_meta = (repair_meta*) 0x6040103df8e0
-       (repair_meta*) for follower: addr = 0x60000432a808, table = myks2.standard1, ip = 127.0.0.1, states = ['127.0.0.1->repair_state::get_sync_boundary_started', '127.0.0.2->repair_state::unknown'], repair_meta = (repair_meta*) 0x60400d73f8e0
+        (gdb) scylla repairs
+        Repairs for which this node is leader:
+          (repair_meta*) 0x60503ab7f7b0: {id: 19197, table: large_collection_test.table_with_large_collection, reason: decommission, row_buf: {len: 0, memory: n/a}, working_row_buf: {len: 30, memory: n/a}, same_shard: True, tablet: False}
+            host: 496e8b0c-50bf-4ada-b8f9-3d167138e908, shard: 5, state: repair_state::get_combined_row_hash_finished
+            host: ce4413ab-33d9-40f8-b13e-d14af8511dda, shard: 4294967295, state: repair_state::put_row_diff_with_rpc_stream_started
+          (repair_meta*) 0x60503717f7b0: {id: 19211, table: large_collection_test.table_with_large_collection, reason: decommission, row_buf: {len: 0, memory: n/a}, working_row_buf: {len: 28, memory: n/a}, same_shard: True, tablet: False}
+            host: 496e8b0c-50bf-4ada-b8f9-3d167138e908, shard: 5, state: repair_state::get_combined_row_hash_finished
+            host: c4936a19-41da-4260-971e-651445d740fd, shard: 4294967295, state: repair_state::get_row_diff_with_rpc_stream_finished
+          (repair_meta*) 0x60502ddff7b0: {id: 19231, table: large_collection_test.table_with_large_collection, reason: decommission, row_buf: {len: 0, memory: n/a}, working_row_buf: {len: 0, memory: n/a}, same_shard: True, tablet: False}
+            host: 496e8b0c-50bf-4ada-b8f9-3d167138e908, shard: 5, state: repair_state::row_level_stop_started
+            host: 039494b6-9d35-4f34-82c4-3c79c1d97175, shard: 4294967295, state: repair_state::row_level_stop_finished
+          (repair_meta*) 0x60501db3f7b0: {id: 19234, table: large_collection_test.table_with_large_collection, reason: decommission, row_buf: {len: 0, memory: n/a}, working_row_buf: {len: 0, memory: n/a}, same_shard: True, tablet: False}
+            host: 496e8b0c-50bf-4ada-b8f9-3d167138e908, shard: 5, state: repair_state::get_sync_boundary_started
+            host: 039494b6-9d35-4f34-82c4-3c79c1d97175, shard: 4294967295, state: repair_state::get_sync_boundary_finished
+          (repair_meta*) 0x60501c81f7b0: {id: 19236, table: large_collection_test.table_with_large_collection, reason: decommission, row_buf: {len: 0, memory: n/a}, working_row_buf: {len: 28, memory: n/a}, same_shard: True, tablet: False}
+            host: 496e8b0c-50bf-4ada-b8f9-3d167138e908, shard: 5, state: repair_state::get_combined_row_hash_finished
+            host: ce4413ab-33d9-40f8-b13e-d14af8511dda, shard: 4294967295, state: repair_state::put_row_diff_with_rpc_stream_started
+          (repair_meta*) 0x60503f65f7b0: {id: 19238, table: large_collection_test.table_with_large_collection, reason: decommission, row_buf: {len: 0, memory: n/a}, working_row_buf: {len: 28, memory: n/a}, same_shard: True, tablet: False}
+            host: 496e8b0c-50bf-4ada-b8f9-3d167138e908, shard: 5, state: repair_state::get_combined_row_hash_finished
+            host: ce4413ab-33d9-40f8-b13e-d14af8511dda, shard: 4294967295, state: repair_state::get_row_diff_with_rpc_stream_finished
+        Repairs for which this node is follower:
     """
 
     def __init__(self):
         gdb.Command.__init__(self, 'scylla repairs', gdb.COMMAND_USER, gdb.COMPLETE_NONE, True)
 
-    def process(self, master, rm):
+    def process(self, rm, calculate_memory_consumption):
         schema = rm['_schema']
         table = schema_ptr(schema).table_name().replace('"', '')
-        all_nodes_state = []
-        ip = str(rm['_myip']).replace('"', '')
+        row_buf = std_list(rm['_row_buf'])
+        working_row_buf = std_list(rm['_working_row_buf'])
+
+        def repair_row_list_memory(row_list):
+            mem = 0
+            repair_row_size = gdb.lookup_type('repair_row').sizeof
+            decorated_key_with_hash_size = gdb.lookup_type('decorated_key_with_hash').sizeof
+            known_dk_with_hash = set()
+
+            for row in row_list:
+                mem += repair_row_size
+
+                fm_opt = std_optional(row['_fm'])
+                if fm_opt:
+                    mem += int(fm_opt.get()['_bytes']['_size'])
+
+                dk_with_hash_ptr = seastar_lw_shared_ptr(row['_dk_with_hash'])
+                if dk_with_hash_ptr:
+                    if int(dk_with_hash_ptr.get()) in known_dk_with_hash:
+                        continue
+
+                    mem += decorated_key_with_hash_size
+                    mem += len(managed_bytes(dk_with_hash_ptr.get()['dk']['_key']['_bytes']))
+
+                mf_ptr = seastar_lw_shared_ptr(row['_mf'])
+                if mf_ptr:
+                    data = std_unique_ptr(mf_ptr.get()['_data'])
+                    if data:
+                        mem += int(data.get()['_memory']['_resources']['memory'])
+
+            return mem
+
+
+        if calculate_memory_consumption:
+            row_buf_mem = repair_row_list_memory(row_buf)
+            working_row_buf_mem = repair_row_list_memory(working_row_buf)
+        else:
+            row_buf_mem = 'n/a'
+            working_row_buf_mem = 'n/a'
+
+
+        gdb.write('  (repair_meta*) {}: {{id: {}, table: {}, reason: {}, row_buf: {{len: {}, memory: {}}}, working_row_buf: {{len: {}, memory: {}}}, same_shard: {}, tablet: {}}}\n'.format(
+            rm.address,
+            int(rm['_repair_meta_id']),
+            table,
+            str(rm['_reason']).split("::")[-1],
+            len(row_buf),
+            row_buf_mem,
+            len(working_row_buf),
+            working_row_buf_mem,
+            bool(rm['_same_sharding_config']),
+            bool(rm['_is_tablet'])))
+
         for n in std_vector(rm['_all_node_states']):
-            all_nodes_state.append(str(n['node']).replace('"', '') + "->" + str(n['state']))
-        gdb.write('(%s*) for %s: addr = %s, table = %s, ip = %s, states = %s, repair_meta = (repair_meta*) %s\n' % (rm.type, master, str(rm.address), table, ip, all_nodes_state, rm.address))
+            gdb.write('    host: {}, shard: {}, state: {}\n'.format(n['node']['id'], n['shard'], n['state']))
 
     def invoke(self, arg, for_tty):
+        parser = argparse.ArgumentParser(description="List running repairs which involve this node and shard. See `help scylla repairs` for more information.")
+        parser.add_argument("-m", "--memory", action="store_true", default=False,
+                help="Calculate memory consumption of repairs (can take a long time)")
+
+        try:
+            args = parser.parse_args(arg.split())
+        except SystemExit:
+            return
+
+        gdb.write('Repairs for which this node is leader:\n')
         for rm in intrusive_list(gdb.parse_and_eval('debug::repair_meta_for_masters._repair_metas'), link='_tracker_link'):
-            self.process("masters", rm)
+            self.process(rm, args.memory)
+        gdb.write('Repairs for which this node is follower:\n')
         for rm in intrusive_list(gdb.parse_and_eval('debug::repair_meta_for_followers._repair_metas'), link='_tracker_link'):
-            self.process("follower", rm)
+            self.process(rm, args.memory)
 
 
 class scylla_tablet_metadata(gdb.Command):

@@ -69,8 +69,8 @@
 #include "test/lib/key_utils.hh"
 #include "test/lib/test_utils.hh"
 #include "test/lib/eventually.hh"
-#include "readers/from_mutations_v2.hh"
-#include "readers/from_fragments_v2.hh"
+#include "readers/from_mutations.hh"
+#include "readers/from_fragments.hh"
 #include "readers/combined.hh"
 #include "utils/assert.hh"
 #include "utils/pretty_printers.hh"
@@ -1666,7 +1666,7 @@ SEASTAR_TEST_CASE(time_window_strategy_time_window_tests) {
 }
 
 SEASTAR_TEST_CASE(time_window_strategy_ts_resolution_check) {
-  return test_env::do_with([] (test_env& env) {
+  return test_env::do_with_async([] (test_env& env) {
     auto ts = 1451001601000L; // 2015-12-25 @ 00:00:01, in milliseconds
     auto ts_in_ms = std::chrono::milliseconds(ts);
     auto ts_in_us = std::chrono::duration_cast<std::chrono::microseconds>(ts_in_ms);
@@ -1702,7 +1702,6 @@ SEASTAR_TEST_CASE(time_window_strategy_ts_resolution_check) {
 
         BOOST_REQUIRE(ret.second == expected);
     }
-    return make_ready_future<>();
   });
 }
 
@@ -2274,7 +2273,7 @@ static std::deque<mutation_fragment_v2> explode(reader_permit permit, std::vecto
     auto schema = muts.front().schema();
     std::deque<mutation_fragment_v2> frags;
 
-    auto mr = make_mutation_reader_from_mutations_v2(schema, permit, std::move(muts));
+    auto mr = make_mutation_reader_from_mutations(schema, permit, std::move(muts));
     auto close_mr = deferred_close(mr);
     mr.consume_pausable([&frags] (mutation_fragment_v2&& mf) {
         frags.emplace_back(std::move(mf));
@@ -2319,6 +2318,7 @@ public:
     using test_func = std::function<void(table_for_tests&, compaction::table_state&, std::vector<sstables::shared_sstable>)>;
 
 private:
+    std::unique_ptr<sstable_compressor_factory> scf = make_sstable_compressor_factory_for_tests_in_thread();
     sharded<test_env> _env;
     uint32_t _seed;
     std::unique_ptr<tests::random_schema_specification> _random_schema_spec;
@@ -2336,7 +2336,7 @@ public:
                 compress))
         , _random_schema(_seed, *_random_schema_spec)
     {
-        _env.start().get();
+        _env.start(test_env_config(), std::ref(*scf)).get();
         testlog.info("random_schema: {}", _random_schema.cql());
     }
 
@@ -2402,12 +2402,14 @@ public:
     using test_func = std::function<void(table_for_tests&, compaction::table_state&, std::vector<sstables::shared_sstable>)>;
 
 private:
+
+    std::unique_ptr<sstable_compressor_factory> scf = make_sstable_compressor_factory_for_tests_in_thread();
     sharded<test_env> _env;
 
 public:
     scrub_test_framework()
     {
-        _env.start().get();
+        _env.start(test_env_config(), std::ref(*scf)).get();
     }
 
     ~scrub_test_framework() {
@@ -2783,9 +2785,9 @@ void scrub_validate_cassandra_compat(const compression_parameters& cp, sstring s
 SEASTAR_THREAD_TEST_CASE(sstable_scrub_validate_mode_test_valid_sstable_cassandra_compat) {
     for (const auto& [cp, subdir] : {
             std::pair{compression_parameters::no_compression(), "uncompressed"},
-            {compression_parameters(compressor::lz4), "lz4"}
+            {compression_parameters(compression_parameters::algorithm::lz4), "lz4"}
         }) {
-        testlog.info("Validating {}compressed SSTable from Cassandra...", cp.get_compressor() ? "" : "un");
+        testlog.info("Validating {}compressed SSTable from Cassandra...", cp.compression_enabled() ? "" : "un");
         scrub_validate_cassandra_compat(
                 cp,
                 seastar::format("test/resource/sstables/3.x/{}/partition_key_with_values_of_different_types", subdir),
@@ -2799,9 +2801,9 @@ SEASTAR_THREAD_TEST_CASE(sstable_scrub_validate_mode_test_valid_sstable_cassandr
 SEASTAR_THREAD_TEST_CASE(sstable_scrub_validate_mode_test_corrupted_file_cassandra_compat) {
     for (const auto& [cp, subdir] : {
             std::pair{compression_parameters::no_compression(), "uncompressed"},
-            {compression_parameters(compressor::lz4), "lz4"}
+            {compression_parameters(compression_parameters::algorithm::lz4), "lz4"}
         }) {
-        testlog.info("Validating {}compressed SSTable from Cassandra with invalid checksums...", cp.get_compressor() ? "" : "un");
+        testlog.info("Validating {}compressed SSTable from Cassandra with invalid checksums...", cp.compression_enabled() ? "" : "un");
         scrub_validate_cassandra_compat(
                 cp,
                 seastar::format("test/resource/sstables/3.x/{}/integrity_check/invalid_checksums", subdir),
@@ -2815,9 +2817,9 @@ SEASTAR_THREAD_TEST_CASE(sstable_scrub_validate_mode_test_corrupted_file_cassand
 SEASTAR_THREAD_TEST_CASE(sstable_scrub_validate_mode_test_corrupted_file_digest_cassandra_compat) {
     for (const auto& [cp, subdir] : {
             std::pair{compression_parameters::no_compression(), "uncompressed"},
-            {compression_parameters(compressor::lz4), "lz4"}
+            {compression_parameters(compression_parameters::algorithm::lz4), "lz4"}
         }) {
-        testlog.info("Validating {}compressed SSTable from Cassandra with invalid digest...", cp.get_compressor() ? "" : "un");
+        testlog.info("Validating {}compressed SSTable from Cassandra with invalid digest...", cp.compression_enabled() ? "" : "un");
         scrub_validate_cassandra_compat(
                 cp,
                 seastar::format("test/resource/sstables/3.x/{}/integrity_check/invalid_digest", subdir),
@@ -3652,7 +3654,7 @@ SEASTAR_TEST_CASE(partial_sstable_run_filtered_out_test) {
 
         sstable_writer_config sst_cfg = env.manager().configure_writer();
         sst_cfg.run_identifier = partial_sstable_run_identifier;
-        auto partial_sstable_run_sst = make_sstable_easy(env, make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), std::move(mut)), sst_cfg);
+        auto partial_sstable_run_sst = make_sstable_easy(env, make_mutation_reader_from_mutations(s, env.make_reader_permit(), std::move(mut)), sst_cfg);
 
         column_family_test(cf).add_sstable(partial_sstable_run_sst).get();
         column_family_test::update_sstables_known_generation(*cf, partial_sstable_run_sst->generation());
@@ -3729,7 +3731,7 @@ SEASTAR_TEST_CASE(purged_tombstone_consumer_sstable_test) {
                 *s, gc_now, max_purgeable_func, tombstone_gc_state(nullptr), std::move(cr), std::move(purged_cr));
 
             auto cs = sstables::make_compaction_strategy(sstables::compaction_strategy_type::size_tiered, s->compaction_strategy_options());
-            auto compacting = make_lw_shared<sstables::sstable_set>(cs.make_sstable_set(s));
+            auto compacting = make_lw_shared<sstables::sstable_set>(env.make_sstable_set(cs, s));
             for (auto&& sst : all) {
                 compacting->insert(std::move(sst));
             }
@@ -4745,7 +4747,7 @@ SEASTAR_TEST_CASE(test_twcs_single_key_reader_filtering) {
 
         auto cs = sstables::make_compaction_strategy(sstables::compaction_strategy_type::time_window, {});
 
-        auto set = cs.make_sstable_set(s);
+        auto set = cs.make_sstable_set(cf.as_table_state());
         set.insert(std::move(sst1));
         set.insert(std::move(sst2));
 
@@ -4938,8 +4940,8 @@ SEASTAR_TEST_CASE(compound_sstable_set_incremental_selector_test) {
         };
 
         {
-            auto set1 = make_lw_shared<sstable_set>(cs.make_sstable_set(s));
-            auto set2 = make_lw_shared<sstable_set>(cs.make_sstable_set(s));
+            auto set1 = make_lw_shared<sstable_set>(env.make_sstable_set(cs, s));
+            auto set2 = make_lw_shared<sstable_set>(env.make_sstable_set(cs, s));
             std::vector<shared_sstable> ssts;
             ssts.push_back(new_sstable(set1, 0, 1, 1));
             ssts.push_back(new_sstable(set2, 0, 1, 1));
@@ -4960,10 +4962,10 @@ SEASTAR_TEST_CASE(compound_sstable_set_incremental_selector_test) {
         }
 
         {
-            auto set1 = make_lw_shared<sstable_set>(cs.make_sstable_set(s));
-            auto set2 = make_lw_shared<sstable_set>(cs.make_sstable_set(s));
+            auto set1 = make_lw_shared<sstable_set>(env.make_sstable_set(cs, s));
+            auto set2 = make_lw_shared<sstable_set>(env.make_sstable_set(cs, s));
             std::vector<shared_sstable> ssts;
-            ssts.push_back(new_sstable(set1, 0, 1, 0));
+            ssts.push_back(new_sstable(set1, 0, 7, 0)); // simulates L0 sstable spanning most of the range.
             ssts.push_back(new_sstable(set2, 0, 1, 1));
             ssts.push_back(new_sstable(set1, 0, 1, 1));
             ssts.push_back(new_sstable(set2, 3, 4, 1));
@@ -4992,8 +4994,9 @@ SEASTAR_TEST_CASE(compound_sstable_set_incremental_selector_test) {
             };
 
             auto incremental_selection_test = [&] (strategy_param param) {
-                auto set1 = make_lw_shared<sstable_set>(sstables::make_partitioned_sstable_set(s, false));
-                auto set2 = make_lw_shared<sstable_set>(sstables::make_partitioned_sstable_set(s, bool(param)));
+                auto token_range = dht::token_range::make(dht::first_token(), dht::last_token());
+                auto set1 = make_lw_shared<sstable_set>(sstables::make_partitioned_sstable_set(s, token_range));
+                auto set2 = make_lw_shared<sstable_set>(sstables::make_partitioned_sstable_set(s, token_range));
                 new_sstable(set1, 1, 1, 1);
                 new_sstable(set2, 0, 2, 1);
                 new_sstable(set2, 3, 3, 1);
@@ -5054,8 +5057,8 @@ SEASTAR_TEST_CASE(twcs_single_key_reader_through_compound_set_test) {
         auto close_cf = deferred_stop(cf);
         cf->start();
 
-        auto set1 = make_lw_shared<sstable_set>(cs.make_sstable_set(s));
-        auto set2 = make_lw_shared<sstable_set>(cs.make_sstable_set(s));
+        auto set1 = make_lw_shared<sstable_set>(cs.make_sstable_set(cf.as_table_state()));
+        auto set2 = make_lw_shared<sstable_set>(cs.make_sstable_set(cf.as_table_state()));
 
         auto sst_gen = env.make_sst_factory(s);
 

@@ -149,7 +149,7 @@ async def check_auth_v2_works(manager: ManagerClient, hosts):
 @pytest.mark.asyncio
 async def test_auth_v2_migration(request, manager: ManagerClient):
     # First, force the first node to start in legacy mode
-    cfg = {**auth_config, 'force_gossip_topology_changes': True, 'enable_tablets': False}
+    cfg = {**auth_config, 'force_gossip_topology_changes': True, 'tablets_mode_for_new_keyspaces': 'disabled'}
 
     servers = [await manager.server_add(config=cfg)]
     # Enable raft-based node operations for subsequent nodes - they should fall back to
@@ -187,7 +187,7 @@ async def test_auth_v2_migration(request, manager: ManagerClient):
 @pytest.mark.asyncio
 async def test_auth_v2_during_recovery(manager: ManagerClient):
     # FIXME: move this test to the Raft-based recovery procedure or remove it if unneeded.
-    servers = await manager.servers_add(3, config=auth_config)
+    servers = await manager.servers_add(3, config=auth_config, auto_rack_dc="dc1")
     cql, hosts = await manager.get_ready_cql(servers)
 
     logging.info("Checking auth version before recovery")

@@ -72,7 +72,7 @@ function(get_padded_dynamic_linker_option output length)
     ERROR_VARIABLE driver_command_line
     ERROR_STRIP_TRAILING_WHITESPACE)
   # extract the argument for the "-dynamic-linker" option
-  if(driver_command_line MATCHES ".*\"?${dynamic_linker_option}\"? \"?([^ \"]*)\"? .*")
+  if(driver_command_line MATCHES ".*\"?${dynamic_linker_option}\"?[ =]\"?([^ \"]*)\"?[ \n].*")
     set(dynamic_linker ${CMAKE_MATCH_1})
   else()
     message(FATAL_ERROR "Unable to find ${dynamic_linker_option} in driver-generated command: "
@@ -135,7 +135,7 @@ function(maybe_limit_stack_usage_in_KB stack_usage_threshold_in_KB config)
   endif()
 endfunction()
 
-macro(update_cxx_flags flags)
+macro(update_build_flags config)
   cmake_parse_arguments (
     parsed_args
     "WITH_DEBUG_INFO"
@@ -145,11 +145,15 @@ macro(update_cxx_flags flags)
   if(NOT DEFINED parsed_args_OPTIMIZATION_LEVEL)
     message(FATAL_ERROR "OPTIMIZATION_LEVEL is missing")
   endif()
-  string(APPEND ${flags}
+  string(TOUPPER ${config} CONFIG)
+  set(cxx_flags "CMAKE_CXX_FLAGS_${CONFIG}")
+  string(APPEND ${cxx_flags}
     " -O${parsed_args_OPTIMIZATION_LEVEL}")
   if(parsed_args_WITH_DEBUG_INFO)
-    string(APPEND ${flags} " -g -gz")
+    string(APPEND ${cxx_flags} " -g -gz")
   endif()
+  unset(CONFIG)
+  unset(cxx_flags)
 endmacro()
 
 set(pgo_opts "")

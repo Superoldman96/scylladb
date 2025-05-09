@@ -255,17 +255,20 @@ public:
         std::vector<uint64_t> samples;
         if (histogram_object.HasMember("sample")) {
             for (const auto& sample : histogram_object["sample"].GetArray()) {
-                samples.push_back(sample.GetInt());
+                samples.push_back(sample.GetInt64());
             }
         }
         return buffer_samples(std::move(samples));
     }
 };
 
-std::vector<sstring> get_keyspaces(scylla_rest_client& client, std::optional<sstring> type = {}) {
+std::vector<sstring> get_keyspaces(scylla_rest_client& client, std::optional<sstring> type = {}, std::optional<sstring> replication = {}) {
     std::unordered_map<sstring, sstring> params;
     if (type) {
         params["type"] = *type;
+    }
+    if (replication) {
+        params["replication"] = *replication;
     }
     auto keyspaces_json = client.get("/storage_service/keyspaces", std::move(params));
     std::vector<sstring> keyspaces;
@@ -479,6 +482,109 @@ void clearsnapshot_operation(scylla_rest_client& client, const bpo::variables_ma
     client.del("/storage_service/snapshots", std::move(params));
 }
 
+static bool keyspace_uses_tablets(scylla_rest_client& client, const sstring& keyspace) {
+    const std::unordered_map<sstring, sstring> params = {{"replication", "tablets"}};
+    const auto res = client.get("/storage_service/keyspaces", params);
+
+    const auto& ks_array = res.GetArray();
+    const auto is_same_ks = [&] (const auto& json_ks) { return rjson::to_string_view(json_ks) == keyspace; };
+    return std::find_if(ks_array.begin(), ks_array.end(), is_same_ks) != ks_array.end();
+}
+
+std::optional<sstring> maybe_get_dcs(scylla_rest_client& client, const bpo::variables_map& vm) {
+    if (vm.contains("in-local-dc")) {
+        const auto res = client.get("/snitch/datacenter");
+        return sstring(rjson::to_string_view(res));
+    } else if (vm.contains("in-dc")) {
+        const auto dcs = vm["in-dc"].as<std::vector<sstring>>();
+        return fmt::to_string(fmt::join(dcs.begin(), dcs.end(), ","));
+    }
+    return std::nullopt;
+}
+
+std::optional<sstring> maybe_get_hosts(const bpo::variables_map& vm) {
+    if (vm.contains("in-hosts")) {
+        const auto hosts = vm["in-hosts"].as<std::vector<sstring>>();
+        return fmt::to_string(fmt::join(hosts.begin(), hosts.end(), ","));
+    }
+    return std::nullopt;
+}
+
+void cluster_repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    std::vector<sstring> keyspaces, tables;
+    if (vm.contains("keyspace")) {
+        auto res = parse_keyspace_and_tables(client, vm, true);
+        auto uses_tablets = keyspace_uses_tablets(client, res.keyspace);
+        if (!uses_tablets) {
+            throw std::invalid_argument("nodetool cluster repair repairs only tablet keyspaces. To repair vnode keyspaces use nodetool repair.");
+        }
+        keyspaces.push_back(std::move(res.keyspace));
+        tables = std::move(res.tables);
+    } else {
+        keyspaces = get_keyspaces(client, "non_local_strategy", "tablets");
+        if (!get_keyspaces(client, "non_local_strategy", "vnodes").empty()) {
+            fmt::print("Warning: only tablet keyspaces will be repaired. To repair vnode keyspaces use nodetool repair.");
+        }
+    }
+
+    std::unordered_map<sstring, sstring> repair_params{{"tokens", "all"}};
+
+    if (vm.contains("tablet-tokens")) {
+        const auto tokens = vm["tablet-tokens"].as<std::vector<sstring>>();
+        repair_params["tokens"] = fmt::to_string(fmt::join(tokens.begin(), tokens.end(), ","));
+    }
+
+    if (auto hosts = maybe_get_hosts(vm); hosts.has_value()) {
+        repair_params["hosts_filter"] = std::move(hosts.value());
+    }
+
+    if (auto dcs = maybe_get_dcs(client, vm); dcs.has_value()) {
+        repair_params["dcs_filter"] = std::move(dcs.value());
+    }
+
+    auto log = [&]<typename... Args> (fmt::format_string<Args...> fmt, Args&&... param) {
+        const auto msg = fmt::format(fmt, param...);
+        using clock = std::chrono::system_clock;
+        const auto n = clock::now();
+        const auto t = clock::to_time_t(n);
+        const auto ms = (n - clock::from_time_t(t)) / 1ms;
+        fmt::print("[{:%F %T},{:03d}] {}\n", fmt::localtime(t), ms, msg);
+    };
+
+    int exit_code = EXIT_SUCCESS;
+    if (!keyspaces.empty()) {
+        auto ks_to_cfs = tables.empty() ? get_ks_to_cfs(client) : std::map<sstring, std::vector<sstring>>{};
+        for (const auto& keyspace : keyspaces) {
+            repair_params["ks"] = keyspace;
+            for (const auto& table : tables.empty() ? ks_to_cfs[keyspace] : tables) {
+                repair_params["table"] = table;
+                try {
+                    sstring task_id = client.post("/storage_service/tablets/repair", repair_params).GetObject()["tablet_task_id"].GetString();
+
+                    log("Starting repair with task_id={} keyspace={} table={}", task_id, keyspace, table);
+
+                    const auto wait_url = format("/task_manager/wait_task/{}", task_id);
+                    const auto res = client.get(wait_url);
+                    const auto status = res.GetObject();
+
+                    if (status["state"] == "failed") {
+                        exit_code = EXIT_FAILURE;
+                        log("ERROR: Repair with task_id={} failed", task_id);
+                    } else {
+                        log("Repair with task_id={} finished", task_id);
+                    }
+                } catch (const api_request_failed& ex) {
+                    log("ERROR: Repair request for keyspace={} table={} failed with {}", keyspace, table, ex);
+                    exit_code = EXIT_FAILURE;
+                }
+            }
+        }
+    }
+    if (exit_code != EXIT_SUCCESS) {
+        throw operation_failed_with_status{exit_code};
+    }
+}
+
 void compact_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     if (vm.contains("user-defined")) {
         throw std::invalid_argument("--user-defined flag is unsupported");
@@ -559,7 +665,7 @@ void compactionhistory_operation(scylla_rest_client& client, const bpo::variable
         std::map<int32_t, int64_t> rows_merged;
         for (const auto& rows_merged_json : history_entry_json_object["rows_merged"].GetArray()) {
             const auto& rows_merged_json_object = rows_merged_json.GetObject();
-            rows_merged.emplace(rows_merged_json_object["key"].GetInt(), rows_merged_json_object["value"].GetInt64());
+            rows_merged.emplace(rows_merged_json_object["key"].GetInt64(), rows_merged_json_object["value"].GetInt64());
         }
 
         history.emplace_back(history_entry{
@@ -673,7 +779,7 @@ std::string format_percent(uint64_t completed, uint64_t total) {
 void report_compaction_remaining_time(scylla_rest_client& client, uint64_t remaining_bytes) {
     std::string fmt_remaining_time;
     auto res = client.get("/storage_service/compaction_throughput");
-    int compaction_throughput_mb_per_sec = res.GetInt();
+    int compaction_throughput_mb_per_sec = res.GetInt64();
     if (compaction_throughput_mb_per_sec != 0) {
         auto remaining_time_in_secs = remaining_bytes / (compaction_throughput_mb_per_sec * 1_MiB);
         std::chrono::hh_mm_ss remaining_time{std::chrono::seconds(remaining_time_in_secs)};
@@ -967,7 +1073,7 @@ void gossipinfo_operation(scylla_rest_client& client, const bpo::variables_map&)
 
         for (auto& element : endpoint["application_state"].GetArray()) {
             const auto& obj = element.GetObject();
-            auto state = static_cast<gms::application_state>(obj["application_state"].GetInt());
+            auto state = static_cast<gms::application_state>(obj["application_state"].GetInt64());
             if (state == gms::application_state::TOKENS) {
                 // skip tokens' state
                 continue;
@@ -1010,7 +1116,7 @@ void info_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     fmt::print("{:<23}: {}\n", "Native Transport active", client.get("/storage_service/native_transport").GetBool());
     fmt::print("{:<23}: {}\n", "Load", file_size_printer(client.get("/storage_service/load").GetDouble()));
     if (gossip_running) {
-        fmt::print("{:<23}: {}\n", "Generation No", client.get("/storage_service/generation_number").GetInt());
+        fmt::print("{:<23}: {}\n", "Generation No", client.get("/storage_service/generation_number").GetInt64());
     } else {
         fmt::print("{:<23}: {}\n", "Generation No", 0);
     }
@@ -1147,15 +1253,15 @@ void print_stream_session(
 
     uint64_t total_count{}, total_size{}, done_count{}, done_size{};
     for (const auto& tbl : summaries.GetArray()) {
-        total_count += tbl["files"].GetInt();
-        total_size += tbl["total_size"].GetInt();
+        total_count += tbl["files"].GetInt64();
+        total_size += tbl["total_size"].GetInt64();
     }
     for (const auto& file_entry : files.GetArray()) {
         const auto& file = file_entry["value"];
-        if (file["current_bytes"].GetInt() == file["total_bytes"].GetInt()) {
+        if (file["current_bytes"].GetInt64() == file["total_bytes"].GetInt64()) {
             ++done_count;
         }
-        done_size += file["current_bytes"].GetInt();
+        done_size += file["current_bytes"].GetInt64();
     }
 
     auto format_bytes = [] (uint64_t value, bool human_readable) {
@@ -1177,12 +1283,12 @@ void print_stream_session(
         const auto& file = file_entry["value"];
         fmt::print(std::cout, "            {} {}/{} bytes({}%) {} {} idx:{}/{}\n",
                 rjson::to_string_view(file["file_name"]),
-                file["current_bytes"].GetInt(),
-                file["total_bytes"].GetInt(),
+                file["current_bytes"].GetInt64(),
+                file["total_bytes"].GetInt64(),
                 uint64_t(file["current_bytes"].GetDouble() / file["total_bytes"].GetDouble() * 100.0),
                 action_perfect,
                 target,
-                file["session_index"].GetInt(),
+                file["session_index"].GetInt64(),
                 rjson::to_string_view(file["peer"]));
     }
 }
@@ -1223,16 +1329,16 @@ void netstats_operation(scylla_rest_client& client, const bpo::variables_map& vm
     }
 
     fmt::print(std::cout, "Read Repair Statistics:\n");
-    fmt::print(std::cout, "Attempted: {}\n", client.get("/storage_proxy/read_repair_attempted").GetInt());
-    fmt::print(std::cout, "Mismatch (Blocking): {}\n", client.get("/storage_proxy/read_repair_repaired_blocking").GetInt());
-    fmt::print(std::cout, "Mismatch (Background): {}\n", client.get("/storage_proxy/read_repair_repaired_background").GetInt());
+    fmt::print(std::cout, "Attempted: {}\n", client.get("/storage_proxy/read_repair_attempted").GetInt64());
+    fmt::print(std::cout, "Mismatch (Blocking): {}\n", client.get("/storage_proxy/read_repair_repaired_blocking").GetInt64());
+    fmt::print(std::cout, "Mismatch (Background): {}\n", client.get("/storage_proxy/read_repair_repaired_background").GetInt64());
 
     constexpr auto line_fmt = "{:<25}{:>10}{:>10}{:>15}{:>10}\n";
 
     auto sum_nodes = [] (auto&& res) {
         uint64_t sum = 0;
         for (const auto& node : res.GetArray()) {
-            sum += node["value"].GetInt();
+            sum += node["value"].GetInt64();
         }
         return sum;
     };
@@ -1418,10 +1524,17 @@ void repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
     std::vector<sstring> keyspaces, tables;
     if (vm.contains("keyspace")) {
         auto res = parse_keyspace_and_tables(client, vm, true);
+        auto uses_tablets = keyspace_uses_tablets(client, res.keyspace);
+        if (uses_tablets) {
+            fmt::print("WARNING: Do not use nodetool repair for tablet keyspaces! To repair tablet keyspaces use nodetool cluster repair.");
+        }
         keyspaces.push_back(std::move(res.keyspace));
         tables = std::move(res.tables);
     } else {
         keyspaces = get_keyspaces(client, "non_local_strategy");
+        if (!get_keyspaces(client, "non_local_strategy", "tablets").empty()) {
+            fmt::print("WARNING: Do not use nodetool repair for tablet keyspaces! To repair tablet keyspaces use nodetool cluster repair.");
+        }
     }
 
     if (vm.contains("partitioner-range") && (vm.contains("in-dc") || vm.contains("in-hosts"))) {
@@ -1456,9 +1569,8 @@ void repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
         repair_params["ignoreUnreplicatedKeyspaces"] = "true";
     }
 
-    if (vm.contains("in-hosts")) {
-        const auto hosts = vm["in-hosts"].as<std::vector<sstring>>();
-        repair_params["hosts"] = fmt::to_string(fmt::join(hosts.begin(), hosts.end(), ","));
+    if (auto hosts = maybe_get_hosts(vm); hosts.has_value()) {
+        repair_params["hosts"] = std::move(hosts.value());
     }
 
     if (vm.contains("sequential")) {
@@ -1467,12 +1579,8 @@ void repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
         repair_params["parallelism"] = "dc_parallel";
     }
 
-    if (vm.contains("in-local-dc")) {
-        const auto res = client.get("/snitch/datacenter");
-        repair_params["dataCenters"] = sstring(rjson::to_string_view(res));
-    } else if (vm.contains("in-dc")) {
-        const auto dcs = vm["in-dc"].as<std::vector<sstring>>();
-        repair_params["dataCenters"] = fmt::to_string(fmt::join(dcs.begin(), dcs.end(), ","));
+    if (auto dcs = maybe_get_dcs(client, vm); dcs.has_value()) {
+        repair_params["dataCenters"] = std::move(dcs.value());
     }
 
     if (vm.contains("pull")) {
@@ -1499,7 +1607,7 @@ void repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
     for (const auto& keyspace : keyspaces) {
         const auto url = format("/storage_service/repair_async/{}", keyspace);
 
-        const auto id = client.post(url, repair_params).GetInt();
+        const auto id = client.post(url, repair_params).GetInt64();
 
         log("Starting repair command #{}, repairing 1 ranges for keyspace {} (parallelism=SEQUENTIAL, full=true)", id, keyspace);
         log("Repair session {}", id);
@@ -1802,15 +1910,6 @@ static std::map<sstring, float> get_effective_ownership(scylla_rest_client& clie
     return rjson_to_map<float>(client.get(request_str, params));
 }
 
-static bool keyspace_uses_tablets(scylla_rest_client& client, const sstring& keyspace) {
-    const std::unordered_map<sstring, sstring> params = {{"replication", "tablets"}};
-    const auto res = client.get("/storage_service/keyspaces", params);
-
-    const auto& ks_array = res.GetArray();
-    const auto is_same_ks = [&] (const auto& json_ks) { return rjson::to_string_view(json_ks) == keyspace; };
-    return std::find_if(ks_array.begin(), ks_array.end(), is_same_ks) != ks_array.end();
-}
-
 void ring_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     const bool resolve_ip = vm.contains("resolve-ip");
 
@@ -1900,7 +1999,7 @@ void scrub_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
 
     std::vector<api::scrub_status> statuses;
     for (const auto& keyspace : keyspaces) {
-        statuses.push_back(api::scrub_status(client.get(format("/storage_service/keyspace_scrub/{}", keyspace), params).GetInt()));
+        statuses.push_back(api::scrub_status(client.get(format("/storage_service/keyspace_scrub/{}", keyspace), params).GetInt64()));
     }
 
     for (const auto status : statuses) {
@@ -3277,7 +3376,7 @@ void version_operation(scylla_rest_client& client, const bpo::variables_map& vm)
 
 void getcompactionthroughput_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     auto res = client.get("/storage_service/compaction_throughput");
-    uint32_t compaction_throughput_mb_per_sec = res.GetInt();
+    uint32_t compaction_throughput_mb_per_sec = res.GetInt64();
     fmt::print("{}\n", compaction_throughput_mb_per_sec);
 }
 
@@ -3293,7 +3392,7 @@ void setcompactionthroughput_operation(scylla_rest_client& client, const bpo::va
 
 void getstreamthroughput_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     auto res = client.get("/storage_service/stream_throughput");
-    uint32_t throughput_mb_per_sec = res.GetInt();
+    uint32_t throughput_mb_per_sec = res.GetInt64();
     if (vm.contains("mib")) {
         fmt::print("{}\n", throughput_mb_per_sec);
     } else {
@@ -3433,6 +3532,52 @@ For more information, see: {}
             },
             {
                 clearsnapshot_operation
+            }
+        },
+        {
+            {
+                "cluster",
+                "Runs operations that affect the entire cluster",
+                "",
+                { },
+                {
+                    typed_option<sstring>("command", "The name of the subcommand", 1),
+                },
+                {
+                    {
+                        "repair",
+                        "Synchronize data between nodes in the background",
+fmt::format(R"(
+When running nodetool cluster repair on a single node, all tablets of
+the specified keyspace(s) are repaired, even if they have no replica on
+this node.
+
+To repair all of the data in the cluster, it is enough to run
+nodetool cluster repair on one node only.
+
+Note that nodetool cluster repair repairs only tablet keyspaces.
+To repair vnode keyspaces use nodetool repair.
+
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/cluster/repair.html")),
+                        {
+                            typed_option<std::vector<sstring>>("in-dc", "Constrain repair to specific datacenter(s)"),
+                            typed_option<std::vector<sstring>>("in-hosts", "Constrain repair to the specific host(s)"),
+                            typed_option<std::vector<sstring>>("tablet-tokens", "Tokens owned by the tablets to repair."),
+                        },
+                        {
+                            typed_option<sstring>("keyspace", "The keyspace to repair, if missing all keyspaces are repaired", 1),
+                            typed_option<std::vector<sstring>>("table", "The table(s) to repair, if missing all tables are repaired", -1),
+                        },
+                    },
+                }
+            },
+            {
+                {
+                    {
+                        "repair", { cluster_repair_operation }
+                    },
+                }
             }
         },
         {
@@ -3950,6 +4095,8 @@ replicas until the master data subset is in-sync.
 
 To repair all of the data in the cluster, you need to run a repair on
 all of the nodes in the cluster, or let ScyllaDB Manager do it for you.
+
+To repair tablet keyspaces use nodetool cluster repair.
 
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/repair.html")),

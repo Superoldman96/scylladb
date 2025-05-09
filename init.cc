@@ -13,6 +13,7 @@
 
 #include <boost/algorithm/string/trim.hpp>
 #include <seastar/core/coroutine.hh>
+#include "sstables/sstable_compressor_factory.hh"
 
 logging::logger startlog("init");
 
@@ -130,45 +131,16 @@ std::any service_set::find(const std::type_info& type) const {
     return _impl->find(type);
 }
 
-future<> read_object_storage_config(db::config& db_cfg) {
-    sstring cfg_name;
-    if (!db_cfg.object_storage_config_file().empty()) {
-        cfg_name = db_cfg.object_storage_config_file();
-    } else {
-        cfg_name = db::config::get_conf_sub("object_storage.yaml").native();
-        if (!co_await file_accessible(cfg_name, access_flags::exists)) {
-            co_return;
-        }
-    }
-
-    auto cfg_file = co_await open_file_dma(cfg_name, open_flags::ro);
-    sstring data;
-    std::exception_ptr ex;
-
-    try {
-        auto sz = co_await cfg_file.size();
-        data = seastar::to_sstring(co_await cfg_file.dma_read_exactly<char>(0, sz));
-    } catch (...) {
-        ex = std::current_exception();
-    }
-    co_await cfg_file.close();
-    if (ex) {
-        co_await coroutine::return_exception_ptr(ex);
-    }
-
-    std::unordered_map<sstring, s3::endpoint_config> cfg;
-    YAML::Node doc = YAML::Load(data.c_str());
-    for (auto&& section : doc) {
-        auto sec_name = section.first.as<std::string>();
-        if (sec_name != "endpoints") {
-            co_await coroutine::return_exception(std::runtime_error(fmt::format("While parsing object_storage config: section {} currently unsupported.", sec_name)));
-        }
-
-        auto endpoints = section.second.as<std::vector<object_storage_endpoint_param>>();
-        for (auto&& ep : endpoints) {
-            cfg[ep.endpoint] = std::move(ep.config);
-        }
-    }
-
-    db_cfg.object_storage_config.set(std::move(cfg));
+// Placed here to avoid dependency on db::config in compress.cc,
+// where the rest of default_sstable_compressor_factory_config is.
+auto default_sstable_compressor_factory_config::from_db_config(
+    const db::config& cfg,
+    std::span<const unsigned> numa_config) -> self
+{
+    return self {
+        .register_metrics = true,
+        .enable_writing_dictionaries = cfg.sstable_compression_dictionaries_enable_writing,
+        .memory_fraction_starting_at_which_we_stop_writing_dicts = cfg.sstable_compression_dictionaries_memory_budget_fraction,
+        .numa_config{numa_config.begin(), numa_config.end()},
+    };
 }

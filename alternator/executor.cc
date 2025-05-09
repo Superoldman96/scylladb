@@ -762,43 +762,54 @@ future<executor::request_return_type> executor::delete_table(client_state& clien
     rjson::value table_description = co_await fill_table_description(schema, table_status::deleting, _proxy, client_state, trace_state, permit);
     co_await verify_permission(_enforce_authorization, client_state, schema, auth::permission::DROP);
     co_await _mm.container().invoke_on(0, [&, cs = client_state.move_to_other_shard()] (service::migration_manager& mm) -> future<> {
-        // FIXME: the following needs to be in a loop. If mm.announce() below
-        // fails, we need to retry the whole thing.
-        auto group0_guard = co_await mm.start_group0_operation();
+        size_t retries = mm.get_concurrent_ddl_retries();
+        for (;;) {
+            auto group0_guard = co_await mm.start_group0_operation();
 
-        std::optional<data_dictionary::table> tbl = p.local().data_dictionary().try_find_table(keyspace_name, table_name);
-        if (!tbl) {
-            throw api_error::resource_not_found(fmt::format("Requested resource not found: Table: {} not found", table_name));
-        }
+            std::optional<data_dictionary::table> tbl = p.local().data_dictionary().try_find_table(keyspace_name, table_name);
+            if (!tbl) {
+                throw api_error::resource_not_found(fmt::format("Requested resource not found: Table: {} not found", table_name));
+            }
 
-        auto m = co_await service::prepare_column_family_drop_announcement(_proxy, keyspace_name, table_name, group0_guard.write_timestamp(), service::drop_views::yes);
-        auto m2 = co_await service::prepare_keyspace_drop_announcement(_proxy.local_db(), keyspace_name, group0_guard.write_timestamp());
+            auto m = co_await service::prepare_column_family_drop_announcement(_proxy, keyspace_name, table_name, group0_guard.write_timestamp(), service::drop_views::yes);
+            auto m2 = co_await service::prepare_keyspace_drop_announcement(_proxy.local_db(), keyspace_name, group0_guard.write_timestamp());
 
-        std::move(m2.begin(), m2.end(), std::back_inserter(m));
+            std::move(m2.begin(), m2.end(), std::back_inserter(m));
 
-        // When deleting a table and its views, we need to remove this role's
-        // special permissions in those tables (undoing the "auto-grant" done
-        // by CreateTable). If we didn't do this, if a second role later
-        // recreates a table with the same name, the first role would still
-        // have permissions over the new table.
-        // To make things more robust we just remove *all* permissions for
-        // the deleted table (CQL's drop_table_statement also does this).
-        // Unfortunately, there is an API mismatch between this code (which
-        // uses separate group0_guard and vector<mutation>) and the function
-        // revoke_all() which uses a combined "group0_batch" structure - so
-        // we need to do some ugly back-and-forth conversions between the pair
-        // to the group0_batch and back to the pair :-(
-        service::group0_batch mc(std::move(group0_guard));
-        mc.add_mutations(std::move(m));
-        auto resource = auth::make_data_resource(schema->ks_name(), schema->cf_name());
-        co_await auth::revoke_all(*cs.get().get_auth_service(), resource, mc);
-        for (const view_ptr& v : tbl->views()) {
-            resource = auth::make_data_resource(v->ks_name(), v->cf_name());
+            // When deleting a table and its views, we need to remove this role's
+            // special permissions in those tables (undoing the "auto-grant" done
+            // by CreateTable). If we didn't do this, if a second role later
+            // recreates a table with the same name, the first role would still
+            // have permissions over the new table.
+            // To make things more robust we just remove *all* permissions for
+            // the deleted table (CQL's drop_table_statement also does this).
+            // Unfortunately, there is an API mismatch between this code (which
+            // uses separate group0_guard and vector<mutation>) and the function
+            // revoke_all() which uses a combined "group0_batch" structure - so
+            // we need to do some ugly back-and-forth conversions between the pair
+            // to the group0_batch and back to the pair :-(
+            service::group0_batch mc(std::move(group0_guard));
+            mc.add_mutations(std::move(m));
+            auto resource = auth::make_data_resource(schema->ks_name(), schema->cf_name());
             co_await auth::revoke_all(*cs.get().get_auth_service(), resource, mc);
-        }
-        std::tie(m, group0_guard) = co_await std::move(mc).extract();
+            for (const view_ptr& v : tbl->views()) {
+                resource = auth::make_data_resource(v->ks_name(), v->cf_name());
+                co_await auth::revoke_all(*cs.get().get_auth_service(), resource, mc);
+            }
+            std::tie(m, group0_guard) = co_await std::move(mc).extract();
 
-        co_await mm.announce(std::move(m), std::move(group0_guard), fmt::format("alternator-executor: delete {} table", table_name));
+            try {
+                co_await mm.announce(std::move(m), std::move(group0_guard), fmt::format("alternator-executor: delete {} table", table_name));
+                break;
+            } catch (const service::group0_concurrent_modification& ex) {
+                elogger.info("Failed to execute DeleteTable {} due to concurrent schema modifications. {}.",
+                        table_name, retries ? "Retrying" : "Number of retries exceeded, giving up");
+                if (retries--) {
+                    continue;
+                }
+                throw;
+            }
+        }
     });
 
     rjson::value response = rjson::empty_object();
@@ -856,7 +867,7 @@ static void add_column(schema_builder& builder, const std::string& name, const r
 // the HASH key name, and the second one, if exists, must be a RANGE key name.
 // The function returns the two column names - the first is the hash key
 // and always present, the second is the range key and may be an empty string.
-static std::pair<std::string, std::string> parse_key_schema(const rjson::value& obj) {
+static std::pair<std::string, std::string> parse_key_schema(const rjson::value& obj, std::string_view supplementary_context) {
     const rjson::value *key_schema;
     if (!obj.IsObject() || !(key_schema = rjson::find(obj, "KeySchema"))) {
         throw api_error::validation("Missing KeySchema member");
@@ -875,6 +886,7 @@ static std::pair<std::string, std::string> parse_key_schema(const rjson::value& 
     if (!v || !v->IsString()) {
         throw api_error::validation("First key in KeySchema must have string AttributeName");
     }
+    validate_attr_name_length(supplementary_context, v->GetStringLength(), true, "HASH key in KeySchema - ");
     std::string hash_key = v->GetString();
     std::string range_key;
     if (key_schema->Size() == 2) {
@@ -889,6 +901,7 @@ static std::pair<std::string, std::string> parse_key_schema(const rjson::value& 
         if (!v || !v->IsString()) {
             throw api_error::validation("Second key in KeySchema must have string AttributeName");
         }
+        validate_attr_name_length(supplementary_context, v->GetStringLength(), true, "RANGE key in KeySchema - ");
         range_key = v->GetString();
     }
     return {hash_key, range_key};
@@ -1155,7 +1168,7 @@ static billing_mode_type verify_billing_mode(const rjson::value& request) {
 // Return the set of attribute names defined in AttributeDefinitions - this
 // set is useful for later verifying that all of them are used by some
 // KeySchema (issue #19784)
-static std::unordered_set<std::string> validate_attribute_definitions(const rjson::value& attribute_definitions){
+static std::unordered_set<std::string> validate_attribute_definitions(std::string_view supplementary_context, const rjson::value& attribute_definitions) {
     if (!attribute_definitions.IsArray()) {
         throw api_error::validation("AttributeDefinitions must be an array");
     }
@@ -1168,6 +1181,7 @@ static std::unordered_set<std::string> validate_attribute_definitions(const rjso
         if (!attribute_name->IsString()) {
             throw api_error::validation("AttributeName in AttributeDefinitions must be a string");
         }
+        validate_attr_name_length(supplementary_context, attribute_name->GetStringLength(), true, "in AttributeDefinitions - ");
         auto [it2, added] = seen_attribute_names.emplace(rjson::to_string_view(*attribute_name));
         if (!added) {
             throw api_error::validation(fmt::format("Duplicate AttributeName={} in AttributeDefinitions",
@@ -1288,12 +1302,12 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
     // any of its GSIs or LSIs. If anything remains in this set at the end of
     // this function, it's an error.
     std::unordered_set<std::string> unused_attribute_definitions =
-        validate_attribute_definitions(*attribute_definitions);
+        validate_attribute_definitions("", *attribute_definitions);
 
     tracing::add_table_name(trace_state, keyspace_name, table_name);
 
     schema_builder builder(keyspace_name, table_name);
-    auto [hash_key, range_key] = parse_key_schema(request);
+    auto [hash_key, range_key] = parse_key_schema(request, "");
     add_column(builder, hash_key, *attribute_definitions, column_kind::partition_key);
     unused_attribute_definitions.erase(hash_key);
     if (!range_key.empty()) {
@@ -1339,7 +1353,7 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             // FIXME: read and handle "Projection" parameter. This will
             // require the MV code to copy just parts of the attrs map.
             schema_builder view_builder(keyspace_name, vname);
-            auto [view_hash_key, view_range_key] = parse_key_schema(l);
+            auto [view_hash_key, view_range_key] = parse_key_schema(l, "Local Secondary Index");
             if (view_hash_key != hash_key) {
                 co_return api_error::validation("LocalSecondaryIndex hash key must match the base table hash key");
             }
@@ -1396,7 +1410,7 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             // FIXME: read and handle "Projection" parameter. This will
             // require the MV code to copy just parts of the attrs map.
             schema_builder view_builder(keyspace_name, vname);
-            auto [view_hash_key, view_range_key] = parse_key_schema(g);
+            auto [view_hash_key, view_range_key] = parse_key_schema(g, "GlobalSecondaryIndexes");
 
             // If an attribute is already a real column in the base table
             // (i.e., a key attribute) or we already made it a real column
@@ -1486,76 +1500,85 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             }
         }
         const bool include_all_columns = true;
-        view_builder.with_view_info(*schema, include_all_columns, ""/*where clause*/);
+        view_builder.with_view_info(schema, include_all_columns, ""/*where clause*/);
     }
 
-    // FIXME: the following needs to be in a loop. If mm.announce() below
-    // fails, we need to retry the whole thing.
-    auto group0_guard = co_await mm.start_group0_operation();
-    auto ts = group0_guard.write_timestamp();
-    std::vector<mutation> schema_mutations;
-    auto ksm = create_keyspace_metadata(keyspace_name, sp, gossiper, ts, tags_map, sp.features());
-    // Alternator Streams doesn't yet work when the table uses tablets (#16317)
-    if (stream_specification && stream_specification->IsObject()) {
-        auto stream_enabled = rjson::find(*stream_specification, "StreamEnabled");
-        if (stream_enabled && stream_enabled->IsBool() && stream_enabled->GetBool()) {
-            locator::replication_strategy_params params(ksm->strategy_options(), ksm->initial_tablets());
-            auto rs = locator::abstract_replication_strategy::create_replication_strategy(ksm->strategy_name(), params);
-            if (rs->uses_tablets()) {
-                co_return api_error::validation("Streams not yet supported on a table using tablets (issue #16317). "
-                "If you want to use streams, create a table with vnodes by setting the tag 'experimental:initial_tablets' set to 'none'.");
+    size_t retries = mm.get_concurrent_ddl_retries();
+    for (;;) {
+        auto group0_guard = co_await mm.start_group0_operation();
+        auto ts = group0_guard.write_timestamp();
+        std::vector<mutation> schema_mutations;
+        auto ksm = create_keyspace_metadata(keyspace_name, sp, gossiper, ts, tags_map, sp.features());
+        // Alternator Streams doesn't yet work when the table uses tablets (#16317)
+        if (stream_specification && stream_specification->IsObject()) {
+            auto stream_enabled = rjson::find(*stream_specification, "StreamEnabled");
+            if (stream_enabled && stream_enabled->IsBool() && stream_enabled->GetBool()) {
+                locator::replication_strategy_params params(ksm->strategy_options(), ksm->initial_tablets());
+                auto rs = locator::abstract_replication_strategy::create_replication_strategy(ksm->strategy_name(), params);
+                if (rs->uses_tablets()) {
+                    co_return api_error::validation("Streams not yet supported on a table using tablets (issue #16317). "
+                    "If you want to use streams, create a table with vnodes by setting the tag 'experimental:initial_tablets' set to 'none'.");
+                }
             }
         }
-    }
-    try {
-        schema_mutations = service::prepare_new_keyspace_announcement(sp.local_db(), ksm, ts);
-    } catch (exceptions::already_exists_exception&) {
-        if (sp.data_dictionary().has_schema(keyspace_name, table_name)) {
-            co_return api_error::resource_in_use(fmt::format("Table {} already exists", table_name));
+        try {
+            schema_mutations = service::prepare_new_keyspace_announcement(sp.local_db(), ksm, ts);
+        } catch (exceptions::already_exists_exception&) {
+            if (sp.data_dictionary().has_schema(keyspace_name, table_name)) {
+                co_return api_error::resource_in_use(fmt::format("Table {} already exists", table_name));
+            }
         }
-    }
-    if (sp.data_dictionary().try_find_table(schema->id())) {
-        // This should never happen, the ID is supposed to be unique
-        co_return api_error::internal(format("Table with ID {} already exists", schema->id()));
-    }
-    co_await service::prepare_new_column_family_announcement(schema_mutations, sp, *ksm, schema, ts);
-    for (schema_builder& view_builder : view_builders) {
-        view_ptr view(view_builder.build());
-        db::schema_tables::add_table_or_view_to_schema_mutation(
-            view, ts, true, schema_mutations);
-        // add_table_or_view_to_schema_mutation() is a low-level function that
-        // doesn't call the callbacks that prepare_new_view_announcement()
-        // calls. So we need to call this callback here :-( If we don't, among
-        // other things *tablets* will not be created for the new view.
-        // These callbacks need to be called in a Seastar thread.
-        co_await seastar::async([&sp, &ksm, &view, &schema_mutations, ts] {
-            return sp.local_db().get_notifier().before_create_column_family(*ksm, *view, schema_mutations, ts);
-        });
-
-    }
-    // If a role is allowed to create a table, we must give it permissions to
-    // use (and eventually delete) the specific table it just created (and
-    // also the view tables). This is known as "auto-grant".
-    // Unfortunately, there is an API mismatch between this code (which uses
-    // separate group0_guard and vector<mutation>) and the function
-    // grant_applicable_permissions() which uses a combined "group0_batch"
-    // structure - so we need to do some ugly back-and-forth conversions
-    // between the pair to the group0_batch and back to the pair :-(
-    service::group0_batch mc(std::move(group0_guard));
-    mc.add_mutations(std::move(schema_mutations));
-    if (client_state.user()) {
-        auto resource = auth::make_data_resource(schema->ks_name(), schema->cf_name());
-        co_await auth::grant_applicable_permissions(
-            *client_state.get_auth_service(), *client_state.user(), resource, mc);
-        for (const schema_builder& view_builder : view_builders) {
-            resource = auth::make_data_resource(view_builder.ks_name(), view_builder.cf_name());
+        if (sp.data_dictionary().try_find_table(schema->id())) {
+            // This should never happen, the ID is supposed to be unique
+            co_return api_error::internal(format("Table with ID {} already exists", schema->id()));
+        }
+        co_await service::prepare_new_column_family_announcement(schema_mutations, sp, *ksm, schema, ts);
+        for (schema_builder& view_builder : view_builders) {
+            view_ptr view(view_builder.build());
+            db::schema_tables::add_table_or_view_to_schema_mutation(
+                view, ts, true, schema_mutations);
+            // add_table_or_view_to_schema_mutation() is a low-level function that
+            // doesn't call the callbacks that prepare_new_view_announcement()
+            // calls. So we need to call this callback here :-( If we don't, among
+            // other things *tablets* will not be created for the new view.
+            // These callbacks need to be called in a Seastar thread.
+            co_await seastar::async([&sp, &ksm, &view, &schema_mutations, ts] {
+                return sp.local_db().get_notifier().before_create_column_family(*ksm, *view, schema_mutations, ts);
+            });
+        }
+        // If a role is allowed to create a table, we must give it permissions to
+        // use (and eventually delete) the specific table it just created (and
+        // also the view tables). This is known as "auto-grant".
+        // Unfortunately, there is an API mismatch between this code (which uses
+        // separate group0_guard and vector<mutation>) and the function
+        // grant_applicable_permissions() which uses a combined "group0_batch"
+        // structure - so we need to do some ugly back-and-forth conversions
+        // between the pair to the group0_batch and back to the pair :-(
+        service::group0_batch mc(std::move(group0_guard));
+        mc.add_mutations(std::move(schema_mutations));
+        if (client_state.user()) {
+            auto resource = auth::make_data_resource(schema->ks_name(), schema->cf_name());
             co_await auth::grant_applicable_permissions(
                 *client_state.get_auth_service(), *client_state.user(), resource, mc);
+            for (const schema_builder& view_builder : view_builders) {
+                resource = auth::make_data_resource(view_builder.ks_name(), view_builder.cf_name());
+                co_await auth::grant_applicable_permissions(
+                    *client_state.get_auth_service(), *client_state.user(), resource, mc);
+            }
+        }
+        std::tie(schema_mutations, group0_guard) = co_await std::move(mc).extract();
+        try {
+            co_await mm.announce(std::move(schema_mutations), std::move(group0_guard), fmt::format("alternator-executor: create {} table", table_name));
+            break;
+        }  catch (const service::group0_concurrent_modification& ex) {
+            elogger.info("Failed to execute CreateTable {} due to concurrent schema modifications. {}.",
+                    table_name, retries ? "Retrying" : "Number of retries exceeded, giving up");
+            if (retries--) {
+                continue;
+            }
+            throw;
         }
     }
-    std::tie(schema_mutations, group0_guard) = co_await std::move(mc).extract();
-
-    co_await mm.announce(std::move(schema_mutations), std::move(group0_guard), fmt::format("alternator-executor: create {} table", table_name));
 
     co_await mm.wait_for_schema_agreement(sp.local_db(), db::timeout_clock::now() + 10s, nullptr);
     rjson::value status = rjson::empty_object();
@@ -1625,204 +1648,214 @@ future<executor::request_return_type> executor::update_table(client_state& clien
 
     co_return co_await _mm.container().invoke_on(0, [&p = _proxy.container(), request = std::move(request), gt = tracing::global_trace_state_ptr(std::move(trace_state)), enforce_authorization = bool(_enforce_authorization), client_state_other_shard = client_state.move_to_other_shard(), empty_request]
                                                 (service::migration_manager& mm) mutable -> future<executor::request_return_type> {
-        // FIXME: the following needs to be in a loop. If mm.announce() below
-        // fails, we need to retry the whole thing.
-        auto group0_guard = co_await mm.start_group0_operation();
+        schema_ptr schema;
+        size_t retries = mm.get_concurrent_ddl_retries();
+        for (;;) {
+            auto group0_guard = co_await mm.start_group0_operation();
 
-        schema_ptr tab = get_table(p.local(), request);
+            schema_ptr tab = get_table(p.local(), request);
 
-        tracing::add_table_name(gt, tab->ks_name(), tab->cf_name());
+            tracing::add_table_name(gt, tab->ks_name(), tab->cf_name());
 
-        // the ugly but harmless conversion to string_view here is because
-        // Seastar's sstring is missing a find(std::string_view) :-()
-        if (std::string_view(tab->cf_name()).find(INTERNAL_TABLE_PREFIX) == 0) {
-            co_await coroutine::return_exception(api_error::validation(fmt::format("Prefix {} is reserved for accessing internal tables", INTERNAL_TABLE_PREFIX)));
-        }
-
-        schema_builder builder(tab);
-
-        rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
-        if (stream_specification && stream_specification->IsObject()) {
-            empty_request = false;
-            add_stream_options(*stream_specification, builder, p.local());
-            // Alternator Streams doesn't yet work when the table uses tablets (#16317)
-            auto stream_enabled = rjson::find(*stream_specification, "StreamEnabled");
-            if (stream_enabled && stream_enabled->IsBool()) {
-                if (stream_enabled->GetBool()) {
-                    if (p.local().local_db().find_keyspace(tab->ks_name()).get_replication_strategy().uses_tablets()) {
-                    co_return api_error::validation("Streams not yet supported on a table using tablets (issue #16317). "
-                        "If you want to enable streams, re-create this table with vnodes (with the tag 'experimental:initial_tablets' set to 'none').");
-                    }
-                    if (tab->cdc_options().enabled()) {
-                        co_return api_error::validation("Table already has an enabled stream: TableName: " + tab->cf_name());
-                    }
-                }
-                else if (!tab->cdc_options().enabled()) {
-                    co_return api_error::validation("Table has no stream to disable: TableName: " + tab->cf_name());
-                }
+            // the ugly but harmless conversion to string_view here is because
+            // Seastar's sstring is missing a find(std::string_view) :-()
+            if (std::string_view(tab->cf_name()).find(INTERNAL_TABLE_PREFIX) == 0) {
+                co_await coroutine::return_exception(api_error::validation(fmt::format("Prefix {} is reserved for accessing internal tables", INTERNAL_TABLE_PREFIX)));
             }
-        }
 
-        auto schema = builder.build();
-        std::vector<view_ptr> new_views;
-        std::vector<std::string> dropped_views;
+            schema_builder builder(tab);
 
-        rjson::value* gsi_updates = rjson::find(request, "GlobalSecondaryIndexUpdates");
-        if (gsi_updates) {
-            if (!gsi_updates->IsArray()) {
-                co_return api_error::validation("GlobalSecondaryIndexUpdates must be an array");
-            }
-            if (gsi_updates->Size() > 1) {
-                // Although UpdateTable takes an array of operations and could
-                // support multiple Create and/or Delete operations in one
-                // command, DynamoDB doesn't actually allows this, and throws
-                // a LimitExceededException if this is attempted.
-                co_return api_error::limit_exceeded("GlobalSecondaryIndexUpdates only allows one index creation or deletion");
-            }
-            if (gsi_updates->Size() == 1) {
+            rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
+            if (stream_specification && stream_specification->IsObject()) {
                 empty_request = false;
-                if (!(*gsi_updates)[0].IsObject() || (*gsi_updates)[0].MemberCount() != 1) {
-                    co_return api_error::validation("GlobalSecondaryIndexUpdates array must contain one object with a Create, Delete or Update operation");
-                }
-                auto it = (*gsi_updates)[0].MemberBegin();
-                const std::string_view op = rjson::to_string_view(it->name);
-                if (!it->value.IsObject()) {
-                    co_return api_error::validation("GlobalSecondaryIndexUpdates entries must be objects");
-                }
-                const rjson::value* index_name_v = rjson::find(it->value, "IndexName");
-                if (!index_name_v || !index_name_v->IsString()) {
-                    co_return api_error::validation("GlobalSecondaryIndexUpdates operation must have IndexName");
-                }
-                std::string_view index_name = rjson::to_string_view(*index_name_v);
-                std::string_view table_name = schema->cf_name();
-                std::string_view keyspace_name = schema->ks_name();
-                std::string vname(view_name(table_name, index_name));
-                if (op == "Create") {
-                    const rjson::value* attribute_definitions = rjson::find(request, "AttributeDefinitions");
-                    if (!attribute_definitions) {
-                        co_return api_error::validation("GlobalSecondaryIndexUpdates Create needs AttributeDefinitions");
-                    }
-                    std::unordered_set<std::string> unused_attribute_definitions =
-                        validate_attribute_definitions(*attribute_definitions);
-                    check_attribute_definitions_conflicts(*attribute_definitions, *schema);
-                    for (auto& view : p.local().data_dictionary().find_column_family(tab).views()) {
-                        check_attribute_definitions_conflicts(*attribute_definitions, *view);
-                    }
-
-                    if (p.local().data_dictionary().has_schema(keyspace_name, vname)) {
-                        // Surprisingly, DynamoDB uses validation error here, not resource_in_use
-                        co_return api_error::validation(fmt::format(
-                            "GSI {} already exists in table {}", index_name, table_name));
-                    }
-                    if (p.local().data_dictionary().has_schema(keyspace_name, lsi_name(table_name, index_name))) {
-                        co_return api_error::validation(fmt::format(
-                            "LSI {} already exists in table {}, can't use same name for GSI", index_name, table_name));
-                    }
-
-                    elogger.trace("Adding GSI {}", index_name);
-                    // FIXME: read and handle "Projection" parameter. This will
-                    // require the MV code to copy just parts of the attrs map.
-                    schema_builder view_builder(keyspace_name, vname);
-                    auto [view_hash_key, view_range_key] = parse_key_schema(it->value);
-                    // If an attribute is already a real column in the base
-                    // table (i.e., a key attribute in the base table or LSI),
-                    // we can use it directly as a view key. Otherwise, we
-                    // need to add it as a "computed column", which extracts
-                    // and deserializes the attribute from the ":attrs" map.
-                    bool view_hash_key_real_column =
-                        schema->get_column_definition(to_bytes(view_hash_key));
-                    add_column(view_builder, view_hash_key, *attribute_definitions, column_kind::partition_key, !view_hash_key_real_column);
-                    unused_attribute_definitions.erase(view_hash_key);
-                    if (!view_range_key.empty()) {
-                        bool view_range_key_real_column =
-                            schema->get_column_definition(to_bytes(view_range_key));
-                        add_column(view_builder, view_range_key, *attribute_definitions, column_kind::clustering_key, !view_range_key_real_column);
-                        if (!schema->get_column_definition(to_bytes(view_range_key)) &&
-                            !schema->get_column_definition(to_bytes(view_hash_key))) {
-                            // FIXME: This warning should go away. See issue #6714
-                            elogger.warn("Only 1 regular column from the base table should be used in the GSI key in order to ensure correct liveness management without assumptions");
+                add_stream_options(*stream_specification, builder, p.local());
+                // Alternator Streams doesn't yet work when the table uses tablets (#16317)
+                auto stream_enabled = rjson::find(*stream_specification, "StreamEnabled");
+                if (stream_enabled && stream_enabled->IsBool()) {
+                    if (stream_enabled->GetBool()) {
+                        if (p.local().local_db().find_keyspace(tab->ks_name()).get_replication_strategy().uses_tablets()) {
+                        co_return api_error::validation("Streams not yet supported on a table using tablets (issue #16317). "
+                            "If you want to enable streams, re-create this table with vnodes (with the tag 'experimental:initial_tablets' set to 'none').");
                         }
-                        unused_attribute_definitions.erase(view_range_key);
-                    }
-                    // Surprisingly, although DynamoDB checks for unused
-                    // AttributeDefinitions in CreateTable, it does not
-                    // check it in UpdateTable. We decided to check anyway.
-                    if (!unused_attribute_definitions.empty()) {
-                        co_return api_error::validation(fmt::format(
-                            "AttributeDefinitions defines spurious attributes not used by any KeySchema: {}",
-                            unused_attribute_definitions));
-                    }
-                    // Base key columns which aren't part of the index's key need to
-                    // be added to the view nonetheless, as (additional) clustering
-                    // key(s).
-                    for (auto& def : schema->primary_key_columns()) {
-                        if  (def.name_as_text() != view_hash_key && def.name_as_text() != view_range_key) {
-                            view_builder.with_column(def.name(), def.type, column_kind::clustering_key);
+                        if (tab->cdc_options().enabled()) {
+                            co_return api_error::validation("Table already has an enabled stream: TableName: " + tab->cf_name());
                         }
                     }
-                    // GSIs have no tags:
-                    view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>());
-                    // Note below we don't need to add virtual columns, as all
-                    // base columns were copied to view. TODO: reconsider the need
-                    // for virtual columns when we support Projection.
-                    for (const column_definition& regular_cdef : schema->regular_columns()) {
-                        if (!view_builder.has_column(*cql3::to_identifier(regular_cdef))) {
-                            view_builder.with_column(regular_cdef.name(), regular_cdef.type, column_kind::regular_column);
-                        }
+                    else if (!tab->cdc_options().enabled()) {
+                        co_return api_error::validation("Table has no stream to disable: TableName: " + tab->cf_name());
                     }
-                    const bool include_all_columns = true;
-                    view_builder.with_view_info(*schema, include_all_columns, ""/*where clause*/);
-                    new_views.emplace_back(view_builder.build());
-                } else if (op == "Delete") {
-                    elogger.trace("Deleting GSI {}", index_name);
-                    if (!p.local().data_dictionary().has_schema(keyspace_name, vname)) {
-                        co_return api_error::resource_not_found(fmt::format("No GSI {} in table {}", index_name, table_name));
-                    }
-                    dropped_views.emplace_back(vname);
-                } else if (op == "Update") {
-                    co_return api_error::validation("GlobalSecondaryIndexUpdates Update not yet supported");
-                } else {
-                    co_return api_error::validation(fmt::format("GlobalSecondaryIndexUpdates supports a Create, Delete or Update operation, saw '{}'", op));
                 }
             }
-        }
 
-        if (empty_request) {
-            co_return api_error::validation("UpdateTable requires one of GlobalSecondaryIndexUpdates, StreamSpecification or BillingMode to be specified");
-        }
+            schema = builder.build();
+            std::vector<view_ptr> new_views;
+            std::vector<std::string> dropped_views;
 
-        co_await verify_permission(enforce_authorization, client_state_other_shard.get(), schema, auth::permission::ALTER);
-        auto m = co_await service::prepare_column_family_update_announcement(p.local(), schema, std::vector<view_ptr>(), group0_guard.write_timestamp());
-        for (view_ptr view : new_views) {
-            auto m2 = co_await service::prepare_new_view_announcement(p.local(), view, group0_guard.write_timestamp());
-            std::move(m2.begin(), m2.end(), std::back_inserter(m));
-        }
-        for (const std::string& view_name : dropped_views) {
-            auto m2 = co_await service::prepare_view_drop_announcement(p.local(), schema->ks_name(), view_name, group0_guard.write_timestamp());
-            std::move(m2.begin(), m2.end(), std::back_inserter(m));
-        }
-        // If a role is allowed to create a GSI, we should give it permissions
-        // to read the GSI it just created. This is known as "auto-grant".
-        // Also, when we delete a GSI we should revoke any permissions set on
-        // it - so if it's ever created again the old permissions wouldn't be
-        // remembered for the new GSI. This is known as "auto-revoke"
-        if (client_state_other_shard.get().user() && (!new_views.empty() || !dropped_views.empty())) {
-            service::group0_batch mc(std::move(group0_guard));
-            mc.add_mutations(std::move(m));
+            rjson::value* gsi_updates = rjson::find(request, "GlobalSecondaryIndexUpdates");
+            if (gsi_updates) {
+                if (!gsi_updates->IsArray()) {
+                    co_return api_error::validation("GlobalSecondaryIndexUpdates must be an array");
+                }
+                if (gsi_updates->Size() > 1) {
+                    // Although UpdateTable takes an array of operations and could
+                    // support multiple Create and/or Delete operations in one
+                    // command, DynamoDB doesn't actually allows this, and throws
+                    // a LimitExceededException if this is attempted.
+                    co_return api_error::limit_exceeded("GlobalSecondaryIndexUpdates only allows one index creation or deletion");
+                }
+                if (gsi_updates->Size() == 1) {
+                    empty_request = false;
+                    if (!(*gsi_updates)[0].IsObject() || (*gsi_updates)[0].MemberCount() != 1) {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates array must contain one object with a Create, Delete or Update operation");
+                    }
+                    auto it = (*gsi_updates)[0].MemberBegin();
+                    const std::string_view op = rjson::to_string_view(it->name);
+                    if (!it->value.IsObject()) {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates entries must be objects");
+                    }
+                    const rjson::value* index_name_v = rjson::find(it->value, "IndexName");
+                    if (!index_name_v || !index_name_v->IsString()) {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates operation must have IndexName");
+                    }
+                    std::string_view index_name = rjson::to_string_view(*index_name_v);
+                    std::string_view table_name = schema->cf_name();
+                    std::string_view keyspace_name = schema->ks_name();
+                    std::string vname(view_name(table_name, index_name));
+                    if (op == "Create") {
+                        const rjson::value* attribute_definitions = rjson::find(request, "AttributeDefinitions");
+                        if (!attribute_definitions) {
+                            co_return api_error::validation("GlobalSecondaryIndexUpdates Create needs AttributeDefinitions");
+                        }
+                        std::unordered_set<std::string> unused_attribute_definitions =
+                            validate_attribute_definitions("GlobalSecondaryIndexUpdates", *attribute_definitions);
+                        check_attribute_definitions_conflicts(*attribute_definitions, *schema);
+                        for (auto& view : p.local().data_dictionary().find_column_family(tab).views()) {
+                            check_attribute_definitions_conflicts(*attribute_definitions, *view);
+                        }
+
+                        if (p.local().data_dictionary().has_schema(keyspace_name, vname)) {
+                            // Surprisingly, DynamoDB uses validation error here, not resource_in_use
+                            co_return api_error::validation(fmt::format(
+                                "GSI {} already exists in table {}", index_name, table_name));
+                        }
+                        if (p.local().data_dictionary().has_schema(keyspace_name, lsi_name(table_name, index_name))) {
+                            co_return api_error::validation(fmt::format(
+                                "LSI {} already exists in table {}, can't use same name for GSI", index_name, table_name));
+                        }
+
+                        elogger.trace("Adding GSI {}", index_name);
+                        // FIXME: read and handle "Projection" parameter. This will
+                        // require the MV code to copy just parts of the attrs map.
+                        schema_builder view_builder(keyspace_name, vname);
+                        auto [view_hash_key, view_range_key] = parse_key_schema(it->value, "GlobalSecondaryIndexUpdates");
+                        // If an attribute is already a real column in the base
+                        // table (i.e., a key attribute in the base table or LSI),
+                        // we can use it directly as a view key. Otherwise, we
+                        // need to add it as a "computed column", which extracts
+                        // and deserializes the attribute from the ":attrs" map.
+                        bool view_hash_key_real_column =
+                            schema->get_column_definition(to_bytes(view_hash_key));
+                        add_column(view_builder, view_hash_key, *attribute_definitions, column_kind::partition_key, !view_hash_key_real_column);
+                        unused_attribute_definitions.erase(view_hash_key);
+                        if (!view_range_key.empty()) {
+                            bool view_range_key_real_column =
+                                schema->get_column_definition(to_bytes(view_range_key));
+                            add_column(view_builder, view_range_key, *attribute_definitions, column_kind::clustering_key, !view_range_key_real_column);
+                            if (!schema->get_column_definition(to_bytes(view_range_key)) &&
+                                !schema->get_column_definition(to_bytes(view_hash_key))) {
+                                // FIXME: This warning should go away. See issue #6714
+                                elogger.warn("Only 1 regular column from the base table should be used in the GSI key in order to ensure correct liveness management without assumptions");
+                            }
+                            unused_attribute_definitions.erase(view_range_key);
+                        }
+                        // Surprisingly, although DynamoDB checks for unused
+                        // AttributeDefinitions in CreateTable, it does not
+                        // check it in UpdateTable. We decided to check anyway.
+                        if (!unused_attribute_definitions.empty()) {
+                            co_return api_error::validation(fmt::format(
+                                "AttributeDefinitions defines spurious attributes not used by any KeySchema: {}",
+                                unused_attribute_definitions));
+                        }
+                        // Base key columns which aren't part of the index's key need to
+                        // be added to the view nonetheless, as (additional) clustering
+                        // key(s).
+                        for (auto& def : schema->primary_key_columns()) {
+                            if  (def.name_as_text() != view_hash_key && def.name_as_text() != view_range_key) {
+                                view_builder.with_column(def.name(), def.type, column_kind::clustering_key);
+                            }
+                        }
+                        // GSIs have no tags:
+                        view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>());
+                        // Note below we don't need to add virtual columns, as all
+                        // base columns were copied to view. TODO: reconsider the need
+                        // for virtual columns when we support Projection.
+                        for (const column_definition& regular_cdef : schema->regular_columns()) {
+                            if (!view_builder.has_column(*cql3::to_identifier(regular_cdef))) {
+                                view_builder.with_column(regular_cdef.name(), regular_cdef.type, column_kind::regular_column);
+                            }
+                        }
+                        const bool include_all_columns = true;
+                        view_builder.with_view_info(schema, include_all_columns, ""/*where clause*/);
+                        new_views.emplace_back(view_builder.build());
+                    } else if (op == "Delete") {
+                        elogger.trace("Deleting GSI {}", index_name);
+                        if (!p.local().data_dictionary().has_schema(keyspace_name, vname)) {
+                            co_return api_error::resource_not_found(fmt::format("No GSI {} in table {}", index_name, table_name));
+                        }
+                        dropped_views.emplace_back(vname);
+                    } else if (op == "Update") {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates Update not yet supported");
+                    } else {
+                        co_return api_error::validation(fmt::format("GlobalSecondaryIndexUpdates supports a Create, Delete or Update operation, saw '{}'", op));
+                    }
+                }
+            }
+
+            if (empty_request) {
+                co_return api_error::validation("UpdateTable requires one of GlobalSecondaryIndexUpdates, StreamSpecification or BillingMode to be specified");
+            }
+
+            co_await verify_permission(enforce_authorization, client_state_other_shard.get(), schema, auth::permission::ALTER);
+            auto m = co_await service::prepare_column_family_update_announcement(p.local(), schema, std::vector<view_ptr>(), group0_guard.write_timestamp());
             for (view_ptr view : new_views) {
-                auto resource = auth::make_data_resource(view->ks_name(), view->cf_name());
-                co_await auth::grant_applicable_permissions(
-                    *client_state_other_shard.get().get_auth_service(), *client_state_other_shard.get().user(), resource, mc);
+                auto m2 = co_await service::prepare_new_view_announcement(p.local(), view, group0_guard.write_timestamp());
+                std::move(m2.begin(), m2.end(), std::back_inserter(m));
             }
-            for (const auto& view_name : dropped_views) {
-                auto resource = auth::make_data_resource(schema->ks_name(), view_name);
-                co_await auth::revoke_all(*client_state_other_shard.get().get_auth_service(), resource, mc);
+            for (const std::string& view_name : dropped_views) {
+                auto m2 = co_await service::prepare_view_drop_announcement(p.local(), schema->ks_name(), view_name, group0_guard.write_timestamp());
+                std::move(m2.begin(), m2.end(), std::back_inserter(m));
+            }
+            // If a role is allowed to create a GSI, we should give it permissions
+            // to read the GSI it just created. This is known as "auto-grant".
+            // Also, when we delete a GSI we should revoke any permissions set on
+            // it - so if it's ever created again the old permissions wouldn't be
+            // remembered for the new GSI. This is known as "auto-revoke"
+            if (client_state_other_shard.get().user() && (!new_views.empty() || !dropped_views.empty())) {
+                service::group0_batch mc(std::move(group0_guard));
+                mc.add_mutations(std::move(m));
+                for (view_ptr view : new_views) {
+                    auto resource = auth::make_data_resource(view->ks_name(), view->cf_name());
+                    co_await auth::grant_applicable_permissions(
+                        *client_state_other_shard.get().get_auth_service(), *client_state_other_shard.get().user(), resource, mc);
+                }
+                for (const auto& view_name : dropped_views) {
+                    auto resource = auth::make_data_resource(schema->ks_name(), view_name);
+                    co_await auth::revoke_all(*client_state_other_shard.get().get_auth_service(), resource, mc);
+                }
+                std::tie(m, group0_guard) = co_await std::move(mc).extract();
+            }
+            try {
+                co_await mm.announce(std::move(m), std::move(group0_guard), format("alternator-executor: update {} table", tab->cf_name()));
+                break;
+            } catch (const service::group0_concurrent_modification& ex) {
+                elogger.info("Failed to execute UpdateTable {} due to concurrent schema modifications. {}.",
+                        tab->cf_name(), retries ? "Retrying" : "Number of retries exceeded, giving up");
+                if (retries--) {
+                    continue;
+                }
+                throw;
+            }
         }
-            std::tie(m, group0_guard) = co_await std::move(mc).extract();
-        }
-
-        co_await mm.announce(std::move(m), std::move(group0_guard), format("alternator-executor: update {} table", tab->cf_name()));
-
         co_await mm.wait_for_schema_agreement(p.local().local_db(), db::timeout_clock::now() + 10s, nullptr);
 
         rjson::value status = rjson::empty_object();
@@ -2049,6 +2082,7 @@ put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr sche
         bytes column_name = to_bytes(it->name.GetString());
         validate_value(it->value, "PutItem");
         const column_definition* cdef = find_attribute(*schema, column_name);
+        validate_attr_name_length("", column_name.size(), cdef && cdef->is_primary_key());
         _length_in_bytes += column_name.size();
         if (!cdef) {
             // This attribute may be a key column of one of the GSI, in which
@@ -2288,7 +2322,7 @@ std::optional<shard_id> rmw_operation::shard_for_execute(bool needs_read_before_
 static future<executor::request_return_type> rmw_operation_return(rjson::value&& attributes, const consumed_capacity_counter& consumed_capacity, uint64_t& metric) {
     rjson::value ret = rjson::empty_object();
     consumed_capacity.add_consumed_capacity_to_response_if_needed(ret);
-    metric += consumed_capacity.get_half_units();
+    metric += consumed_capacity.get_consumed_capacity_units();
     if (!attributes.IsNull()) {
         rjson::add(ret, "Attributes", std::move(attributes));
     }
@@ -2764,12 +2798,26 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
     rjson::value& request_items = request["RequestItems"];
     auto start_time = std::chrono::steady_clock::now();
 
+    const auto maximum_batch_write_size = _proxy.data_dictionary().get_config().alternator_max_items_in_batch_write();
+
+    size_t total_items = 0;
+    for (auto it = std::as_const(request_items).MemberBegin(); it != std::as_const(request_items).MemberEnd(); ++it) {
+        total_items += it->value.Size();
+    }
+    if (total_items > maximum_batch_write_size) {
+        co_return api_error::validation(fmt::format("Invalid length of BatchWriteItem command, got {} items, "
+            "maximum is {} (from configuration variable alternator_max_items_in_batch_write)", total_items, maximum_batch_write_size));
+    }
+    bool should_add_wcu = wcu_consumed_capacity_counter::should_add_capacity(request);
+    size_t wcu_put_units = 0;
+    size_t wcu_delete_units = 0;
+    rjson::value consumed_capacity = rjson::empty_array();
     std::vector<std::pair<schema_ptr, put_or_delete_item>> mutation_builders;
     mutation_builders.reserve(request_items.MemberCount());
-    uint batch_size = 0;
     for (auto it = request_items.MemberBegin(); it != request_items.MemberEnd(); ++it) {
         schema_ptr schema = get_table_from_batch_request(_proxy, it);
         tracing::add_table_name(trace_state, schema->ks_name(), schema->cf_name());
+        size_t wcu_units = 0;
         std::unordered_set<primary_key, primary_key_hash, primary_key_equal> used_keys(
                 1, primary_key_hash{schema}, primary_key_equal{schema});
         for (auto& request : it->value.GetArray()) {
@@ -2781,17 +2829,22 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
             if (r_name == "PutRequest") {
                 const rjson::value& put_request = r->value;
                 const rjson::value& item = put_request["Item"];
-                mutation_builders.emplace_back(schema, put_or_delete_item(
+                auto&& put_item = put_or_delete_item(
                         item, schema, put_or_delete_item::put_item{},
-                        si_key_attributes(_proxy.data_dictionary().find_table(schema->ks_name(), schema->cf_name()))));
+                        si_key_attributes(_proxy.data_dictionary().find_table(schema->ks_name(), schema->cf_name())));
+                auto units = wcu_consumed_capacity_counter::get_units(put_item.length_in_bytes());
+                wcu_units += units;
+                wcu_put_units += units;
+                mutation_builders.emplace_back(schema, std::move(put_item));
                 auto mut_key = std::make_pair(mutation_builders.back().second.pk(), mutation_builders.back().second.ck());
                 if (used_keys.contains(mut_key)) {
                     co_return api_error::validation("Provided list of item keys contains duplicates");
                 }
                 used_keys.insert(std::move(mut_key));
-                batch_size++;
             } else if (r_name == "DeleteRequest") {
                 const rjson::value& key = (r->value)["Key"];
+                wcu_units++; // Delete is always 1 unit
+                wcu_delete_units++;
                 mutation_builders.emplace_back(schema, put_or_delete_item(
                         key, schema, put_or_delete_item::delete_item{}));
                 auto mut_key = std::make_pair(mutation_builders.back().second.pk(),
@@ -2800,27 +2853,35 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
                     co_return api_error::validation("Provided list of item keys contains duplicates");
                 }
                 used_keys.insert(std::move(mut_key));
-                batch_size++;
             } else {
                 co_return api_error::validation(fmt::format("Unknown BatchWriteItem request type: {}", r_name));
             }
         }
+        if (should_add_wcu) {
+            rjson::value entry = rjson::empty_object();
+            rjson::add(entry, "TableName", rjson::from_string(rjson::to_string_view(it->name)));
+            rjson::add(entry, "CapacityUnits", wcu_units);
+            rjson::push_back(consumed_capacity, std::move(entry));
+        }
     }
-
     for (const auto& b : mutation_builders) {
         co_await verify_permission(_enforce_authorization, client_state, b.first, auth::permission::MODIFY);
     }
-
-    _stats.api_operations.batch_write_item_batch_total += batch_size;
-    co_return co_await do_batch_write(_proxy, _ssg, std::move(mutation_builders), client_state, trace_state, std::move(permit), _stats).then([start_time, this] () {
-        // FIXME: Issue #5650: If we failed writing some of the updates,
-        // need to return a list of these failed updates in UnprocessedItems
-        // rather than fail the whole write (issue #5650).
-        rjson::value ret = rjson::empty_object();
-        rjson::add(ret, "UnprocessedItems", rjson::empty_object());
-        _stats.api_operations.batch_write_item_latency.mark(std::chrono::steady_clock::now() - start_time);
-        return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
-    });
+    _stats.wcu_total[stats::PUT_ITEM] += wcu_put_units;
+    _stats.wcu_total[stats::DELETE_ITEM] += wcu_delete_units;
+    _stats.api_operations.batch_write_item_batch_total += total_items;
+    _stats.api_operations.batch_write_item_histogram.add(total_items);
+    co_await do_batch_write(_proxy, _ssg, std::move(mutation_builders), client_state, trace_state, std::move(permit), _stats);
+    // FIXME: Issue #5650: If we failed writing some of the updates,
+    // need to return a list of these failed updates in UnprocessedItems
+    // rather than fail the whole write (issue #5650).
+    rjson::value ret = rjson::empty_object();
+    rjson::add(ret, "UnprocessedItems", rjson::empty_object());
+    if (should_add_wcu) {
+        rjson::add(ret, "ConsumedCapacity", std::move(consumed_capacity));
+    }
+    _stats.api_operations.batch_write_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    co_return make_jsonable(std::move(ret));
 }
 
 static std::string get_item_type_string(const rjson::value& v) {
@@ -3079,6 +3140,7 @@ static std::optional<attrs_to_get> calculate_attrs_to_get(const rjson::value& re
         attrs_to_get ret;
         for (auto it = attributes_to_get.Begin(); it != attributes_to_get.End(); ++it) {
             attribute_path_map_add("AttributesToGet", ret, it->GetString());
+            validate_attr_name_length("AttributesToGet", it->GetStringLength(), false);
         }
         if (ret.empty()) {
             throw api_error::validation("Empty AttributesToGet is not allowed. Consider using Select=COUNT instead.");
@@ -3219,14 +3281,17 @@ future<std::vector<rjson::value>> executor::describe_multi_item(schema_ptr schem
         const query::partition_slice&& slice,
         shared_ptr<cql3::selection::selection> selection,
         foreign_ptr<lw_shared_ptr<query::result>> query_result,
-        shared_ptr<const std::optional<attrs_to_get>> attrs_to_get) {
+        shared_ptr<const std::optional<attrs_to_get>> attrs_to_get,
+        uint64_t& rcu_half_units) {
     cql3::selection::result_set_builder builder(*selection, gc_clock::now());
     query::result_view::consume(*query_result, slice, cql3::selection::result_set_builder::visitor(builder, *schema, *selection));
     auto result_set = builder.build();
     std::vector<rjson::value> ret;
     for (auto& result_row : result_set->rows()) {
         rjson::value item = rjson::empty_object();
-        describe_single_item(*selection, result_row, *attrs_to_get, item);
+        rcu_consumed_capacity_counter consumed_capacity;
+        describe_single_item(*selection, result_row, *attrs_to_get, item, &consumed_capacity._total_bytes);
+        rcu_half_units += consumed_capacity.get_half_units();
         ret.push_back(std::move(item));
         co_await coroutine::maybe_yield();
     }
@@ -3382,6 +3447,9 @@ update_item_operation::update_item_operation(service::storage_proxy& proxy, rjso
     if (_attribute_updates) {
         if (!_attribute_updates->IsObject()) {
             throw api_error::validation("AttributeUpdates must be an object");
+        }
+        for (auto it = std::as_const(*_attribute_updates).MemberBegin(); it != std::as_const(*_attribute_updates).MemberEnd(); ++it) {
+            validate_attr_name_length("AttributeUpdates", it->name.GetStringLength(), false);
         }
     }
 
@@ -4055,7 +4123,7 @@ future<executor::request_return_type> executor::get_item(client_state& client_st
 
         _stats.api_operations.get_item_latency.mark(std::chrono::steady_clock::now() - start_time);
 
-        return make_ready_future<executor::request_return_type>(make_jsonable(describe_item(schema, partition_slice, *selection, *qr.query_result, std::move(attrs_to_get), add_capacity, _stats.rcu_total)));
+        return make_ready_future<executor::request_return_type>(make_jsonable(describe_item(schema, partition_slice, *selection, *qr.query_result, std::move(attrs_to_get), add_capacity, _stats.rcu_half_units_total)));
     });
 }
 
@@ -4127,6 +4195,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     // listing all the request aimed at a single table. For efficiency, inside
     // each table_requests we further group together all reads going to the
     // same partition, so we can later send them together.
+    bool should_add_rcu = rcu_consumed_capacity_counter::should_add_capacity(request);
     struct table_requests {
         schema_ptr schema;
         db::consistency_level cl;
@@ -4153,6 +4222,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
         }
     };
     std::vector<table_requests> requests;
+    std::vector<std::vector<uint64_t>> responses_sizes;
     uint batch_size = 0;
     for (auto it = request_items.MemberBegin(); it != request_items.MemberEnd(); ++it) {
         table_requests rs(get_table_from_batch_request(_proxy, it));
@@ -4176,10 +4246,15 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     }
 
     _stats.api_operations.batch_get_item_batch_total += batch_size;
+    _stats.api_operations.batch_get_item_histogram.add(batch_size);
     // If we got here, all "requests" are valid, so let's start the
     // requests for the different partitions all in parallel.
     std::vector<future<std::vector<rjson::value>>> response_futures;
+    responses_sizes.resize(requests.size());
+    size_t responses_sizes_pos = 0;
     for (const auto& rs : requests) {
+        responses_sizes[responses_sizes_pos].resize(rs.requests.size());
+        size_t pos = 0;
         for (const auto &r : rs.requests) {
             auto& pk = r.first;
             auto& cks = r.second;
@@ -4202,12 +4277,14 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
             command->allow_limit = db::allow_per_partition_rate_limit::yes;
             future<std::vector<rjson::value>> f = _proxy.query(rs.schema, std::move(command), std::move(partition_ranges), rs.cl,
                     service::storage_proxy::coordinator_query_options(executor::default_timeout(), permit, client_state, trace_state)).then(
-                    [schema = rs.schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = rs.attrs_to_get] (service::storage_proxy::coordinator_query_result qr) mutable {
+                    [schema = rs.schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = rs.attrs_to_get, &response_size = responses_sizes[responses_sizes_pos][pos]] (service::storage_proxy::coordinator_query_result qr) mutable {
                 utils::get_local_injector().inject("alternator_batch_get_item", [] { throw std::runtime_error("batch_get_item injection"); });
-                return describe_multi_item(std::move(schema), std::move(partition_slice), std::move(selection), std::move(qr.query_result), std::move(attrs_to_get));
+                return describe_multi_item(std::move(schema), std::move(partition_slice), std::move(selection), std::move(qr.query_result), std::move(attrs_to_get), response_size);
             });
+            pos++;
             response_futures.push_back(std::move(f));
         }
+        responses_sizes_pos++;
     }
 
     // Wait for all requests to complete, and then return the response.
@@ -4219,10 +4296,14 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     rjson::value response = rjson::empty_object();
     rjson::add(response, "Responses", rjson::empty_object());
     rjson::add(response, "UnprocessedKeys", rjson::empty_object());
-
+    size_t rcu_half_units;
     auto fut_it = response_futures.begin();
+    responses_sizes_pos = 0;
+    rjson::value consumed_capacity = rjson::empty_array();
     for (const auto& rs : requests) {
-        auto table = table_name(*rs.schema);
+        std::string table = table_name(*rs.schema);
+        size_t pos = 0;
+        rcu_half_units = 0;
         for (const auto &r : rs.requests) {
             auto& pk = r.first;
             auto& cks = r.second;
@@ -4237,6 +4318,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
                 for (rjson::value& json : results) {
                     rjson::push_back(response["Responses"][table], std::move(json));
                 }
+                rcu_half_units += rcu_consumed_capacity_counter::get_half_units(responses_sizes[responses_sizes_pos][pos], rs.cl == db::consistency_level::LOCAL_QUORUM);
             } catch(...) {
                 eptr = std::current_exception();
                 // This read of potentially several rows in one partition,
@@ -4260,7 +4342,20 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
                     rjson::push_back(response["UnprocessedKeys"][table]["Keys"], std::move(*ck.second));
                 }
             }
+            pos++;
         }
+        _stats.rcu_half_units_total += rcu_half_units;
+        if (should_add_rcu) {
+            rjson::value entry = rjson::empty_object();
+            rjson::add(entry, "TableName", table);
+            rjson::add(entry, "CapacityUnits", rcu_half_units*0.5);
+            rjson::push_back(consumed_capacity, std::move(entry));
+        }
+        responses_sizes_pos++;
+    }
+
+    if (should_add_rcu) {
+        rjson::add(response, "ConsumedCapacity", std::move(consumed_capacity));
     }
     elogger.trace("Unprocessed keys: {}", response["UnprocessedKeys"]);
     if (!some_succeeded && eptr) {

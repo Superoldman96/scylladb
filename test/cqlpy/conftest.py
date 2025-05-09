@@ -24,6 +24,7 @@ import time
 import random
 
 from .util import unique_name, new_test_keyspace, keyspace_has_tablets, cql_session, local_process_id, is_scylla, config_value_context
+from .nodetool import scylla_log
 from test.pylib.minio_server import MinioServer
 
 print(f"Driver name {DRIVER_NAME}, version {DRIVER_VERSION}")
@@ -79,13 +80,20 @@ def cql(request):
 # crashed Scylla and stop running any more tests.
 @pytest.fixture(scope="function", autouse=True)
 def cql_test_connection(cql, request):
+    scylla_log(cql, f'test/cqlpy: Starting {request.node.parent.name}::{request.node.name}', 'info')
+    if cql_test_connection.scylla_crashed:
+        pytest.skip('Server down')
     yield
     try:
         # We want to run a do-nothing CQL command. 
         # "BEGIN BATCH APPLY BATCH" is the closest to do-nothing I could find...
         cql.execute("BEGIN BATCH APPLY BATCH")
     except:
-        pytest.exit(f"Scylla appears to have crashed in test {request.node.parent.name}::{request.node.name}")
+        cql_test_connection.scylla_crashed = True
+        pytest.fail(f'Scylla appears to have crashed in test {request.node.parent.name}::{request.node.name}')
+    scylla_log(cql, f'test/cqlpy: Ended {request.node.parent.name}::{request.node.name}', 'info')
+
+cql_test_connection.scylla_crashed = False
 
 # Until Cassandra 4, NetworkTopologyStrategy did not support the option
 # replication_factor (https://issues.apache.org/jira/browse/CASSANDRA-14303).

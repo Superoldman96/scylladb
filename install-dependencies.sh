@@ -80,7 +80,7 @@ fedora_packages=(
     python3
     python3-aiohttp
     python3-pip
-    python3-magic
+    python3-file-magic
     python3-colorama
     python3-tabulate
     python3-boto3
@@ -120,7 +120,6 @@ fedora_packages=(
     wabt
     binaryen
     lcov
-    java-11-openjdk-devel # for tools/java
 
     llvm-bolt
     moreutils
@@ -132,6 +131,11 @@ fedora_packages=(
     cyrus-sasl
     fipscheck
     cpp-jwt-devel
+
+    podman
+    buildah
+
+    https://github.com/scylladb/cassandra-stress/releases/download/v3.17.5/cassandra-stress-3.17.5-1.noarch.rpm
 )
 
 # lld is not available on s390x, see
@@ -329,7 +333,6 @@ fi
 umask 0022
 
 ./seastar/install-dependencies.sh
-./tools/java/install-dependencies.sh
 
 if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
     apt-get -y install "${debian_base_packages[@]}"
@@ -360,7 +363,7 @@ elif [ "$ID" = "fedora" ]; then
     do
         pip_constrained_packages="${pip_constrained_packages} ${package}${pip_packages[$package]}"
     done
-    pip3 install --upgrade "$PIP_DEFAULT_ARGS" $pip_constrained_packages
+    pip3 install --upgrade --no-cache-dir "$PIP_DEFAULT_ARGS" $pip_constrained_packages
 
     if [ -f "$(node_exporter_fullpath)" ] && node_exporter_checksum; then
         echo "$(node_exporter_filename) already exists, skipping download"
